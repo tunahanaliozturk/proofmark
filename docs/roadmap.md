@@ -1,0 +1,29 @@
+# Roadmap
+
+Each milestone ends with a test that has to pass. A milestone is not done because the code exists.
+
+| # | Milestone | Scope | Exit test |
+| --- | --- | --- | --- |
+| M0 | Plan | Repository, lints, CI, design, roadmap, decision records. | CI green on a crate that only prints its name and version. |
+| M1 | Wire and signing | HTTP/1.1 client on blocking sockets with optional TLS (`100 Continue`, chunked bodies, `HEAD`, timeouts). SigV4 for headers, presigned URLs and signed chunks. CRC32, CRC32C, CRC64NVME, SHA-256, MD5, base64, the `aws-chunked` encoder and decoder. The fake server's skeleton: bucket and object `PUT`, `GET`, `HEAD`, `DELETE`, with signature checks. Decide `ring` or `aws-lc-rs` (ADR if it changes). | The applicable cases of the aws-c-auth SigV4 suite and the S3 documentation examples pass; a signer that normalises `//` fails them. Every CRC matches its catalogue check value. A signed `PUT` and `GET` round-trip through the fake on all three CI platforms, and a wrong secret gets 403. The response parser survives 10 minutes of fuzzing with no panic and no hang. |
+| M2 | Safety, runner and reports | Bucket naming, the empty-bucket check, the ledger, `cleanup` (ADR 0004). Probe registry, runner, statuses (ADR 0003), the mutation test harness (ADR 0005). Terminal, JSON, JUnit and Markdown output. `list`, `explain`, exit codes. The 14 `basic` probes. | A non-empty existing bucket makes `run` exit 3 with zero writes. A foreign object written mid-run survives cleanup. A run aborted after N requests, for every N up to the length of the run, leaves a ledger from which `cleanup` removes exactly what the run wrote. Every `basic` probe passes on the correct fake and fails on each of its faults. A planted secret appears in no output format. One test per exit code. |
+| M3 | Listing, addressing, multipart, copy | The `listing`, `addressing`, `multipart` and `copy` probes and their faults in the fake (for example `ListSkipsAtPageBoundary`, `ListUtf16Order`, `WrongCompositeEtag`, `CopyDropsMetadata`). | Mutation test green for all of them. The unusual-keys probe round-trips every key byte for byte through the fake with both addressing styles. A fault that drops one key at a page boundary is caught. |
+| M4 | Checksums and SDK request shapes | The `checksums` probes, trailers, signed streaming, multipart checksums. `proofmark fake --record`. Request heads captured from the AWS CLI v2 and boto3 at their current versions, checked in as fixtures with the versions. | Mutation test green, including `StoreChunkFraming`, `IgnoreChecksum` and `RejectChecksumAlgorithmHeader`. Every checksum probe that stands for an SDK default sends the same header names and encodings as the captured fixture; a test fails if they drift. |
+| M5 | Conditional requests, races, versioning | The `conditional` and `versioning` probes. Barrier-released race workers, the contended-round measure, the `RacyIfNoneMatch` and `RacyIfMatch` faults. | 100 runs of each race probe against the racy fault catch it every time; 100 runs against the correct fake report no lost update. A fake that serialises all requests makes the race probe `inconclusive`, not `pass`. Mutation test green, including `IgnoreGetIfMatch` (Garage #804). |
+| M6 | Object Lock, presigned URLs, profiles | The `object lock` and `presigned` probes, server-clock offsets, `--allow-compliance-lock`. The five profiles, each citing the client source at a commit. | Mutation test green, including `IgnoreRetention` and `PresignNoExpiry`. A governance-locked object is removed by cleanup; a compliance-locked object makes the run wait and then cleans up, with a fake clock in the test. Every profile names only existing probes and carries a source link; a profile with a broken reference fails the build. |
+| M7 | Store matrix and release | `stores/` with set-up for Garage, SeaweedFS, RustFS and versitygw on pinned images, Ozone and Ceph RGW if they fit (see open questions). The `stores.yml` workflow, `report --input` merge and `--baseline`. The weekly citation link check. README with the published matrix. Two PNG diagrams, light and dark, drawn by a script in `tools/`: the run's data flow, and the probe life cycle with ledger and cleanup. Release binaries for the platforms in the design. | The store workflow is green on every included store and its results equal the checked-in baselines; flipping one entry in a baseline makes it fail. The README walkthrough (`proofmark fake` in one terminal, `proofmark run` in another) works on a clean Windows machine. Tag v0.1.0 after an explicit go-ahead; publishing to crates.io is a separate decision. |
+
+## Progress
+
+- **M0**, 2026-11-22: done locally. Design, roadmap and five ADRs. The crate prints its name and version; `cargo fmt --check`, `cargo clippy` (warnings as errors), `cargo doc`, `cargo build` and `cargo test` pass on Windows. CI has not run yet, because the repository has not been pushed; the exit test is met on the first green CI run.
+
+## Order of work inside a milestone
+
+1. Write the fault in the fake first, and the probe's judge test, and see them fail.
+2. Implement the probe until it passes on the correct fake and fails on the fault.
+3. Cite the expectation. No citation, no probe.
+4. Record any decision that is hard to reverse as an ADR.
+
+## After the first release
+
+Not planned, listed so they are not forgotten: SHA-1, SHA-512 and the xxHash checksum algorithms; `UploadPartCopy`; ListObjects version 1; tagging; `GetObjectAttributes`; reading credentials from `~/.aws`; keep-alive connection reuse; colour in the terminal output; SigV4a; HTTP/2; more stores in the matrix as they appear; a reference run on AWS if someone offers one; profiles for more clients (rclone, Velero, Thanos, Kopia); a library crate if anyone asks for one.

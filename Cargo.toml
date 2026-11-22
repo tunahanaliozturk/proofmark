@@ -1,0 +1,46 @@
+[package]
+name = "proofmark"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Probes an S3-compatible endpoint and reports, feature by feature, whether it behaves the way S3 clients expect"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tunahanaliozturk/proofmark"
+readme = "README.md"
+keywords = ["s3", "object-storage", "compatibility", "conformance", "testing"]
+categories = ["command-line-utilities", "development-tools::testing"]
+exclude = ["/.github", "/docs"]
+publish = false
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unreachable_pub = "warn"
+missing_debug_implementations = "warn"
+unused_qualifications = "warn"
+unused_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+expect_used = "warn"
+panic = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+clone_on_ref_ptr = "warn"
+unimplemented = "warn"
+cast_possible_truncation = "warn"
+cast_lossless = "warn"
+dbg_macro = "warn"
+explicit_iter_loop = "warn"
+manual_let_else = "warn"
+needless_pass_by_value = "warn"
+redundant_closure_for_method_calls = "warn"
+semicolon_if_nothing_returned = "warn"
+todo = "warn"
+unwrap_used = "warn"
