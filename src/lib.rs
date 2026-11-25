@@ -7,6 +7,7 @@
 
 pub mod aws_chunked;
 pub mod checksum;
+pub mod fake;
 pub mod http;
 pub mod rng;
 pub mod sigv4;
