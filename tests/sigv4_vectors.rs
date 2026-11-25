@@ -28,8 +28,7 @@ use proofmark::aws_chunked;
 use proofmark::checksum::sha256_hex;
 use proofmark::http::Request;
 use proofmark::sigv4::{
-    Credentials, EMPTY_SHA256, STREAMING_SIGNED, STREAMING_SIGNED_TRAILER, Signer,
-    UNSIGNED_PAYLOAD, percent_decode,
+    Credentials, EMPTY_SHA256, STREAMING_SIGNED, STREAMING_SIGNED_TRAILER, Signer, percent_decode,
 };
 use proofmark::time::UtcTime;
 
@@ -208,7 +207,7 @@ impl Case {
         // Presigned (query string) form.
         let expires: u32 = self.value("expiration_in_seconds").parse().expect("number");
         let mut request = build(method, path, query, file_headers, body);
-        let presigned = signer.presign(&mut request, expires, &payload_hash);
+        let presigned = signer.presign(&mut request, expires);
         self.expect_file(presigned.canonical_request(), "query-canonical-request.txt");
         self.expect_file(presigned.string_to_sign(), "query-string-to-sign.txt");
         self.expect_file(presigned.signature(), "query-signature.txt");
@@ -389,7 +388,7 @@ fn the_s3_presigned_url_example_signs_as_documented() {
     let signer = Signer::new(&credentials, "us-east-1", "s3", example_time());
     let mut request =
         Request::new("GET", "/test.txt").with_header("Host", "examplebucket.s3.amazonaws.com");
-    let signature = signer.presign(&mut request, 86_400, UNSIGNED_PAYLOAD);
+    let signature = signer.presign(&mut request, 86_400);
     assert_eq!(
         signature.canonical_request(),
         "GET\n/test.txt\nX-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host\nhost:examplebucket.s3.amazonaws.com\n\nhost\nUNSIGNED-PAYLOAD"

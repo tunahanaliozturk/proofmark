@@ -323,14 +323,19 @@ impl<'a> Signer<'a> {
     }
 
     /// Turns `request` into a presigned request: appends the `X-Amz-*`
-    /// query parameters, with `X-Amz-Signature` last. S3 uses
-    /// [`UNSIGNED_PAYLOAD`] as the payload hash of a presigned URL.
-    pub fn presign(
-        &self,
-        request: &mut Request,
-        expires_seconds: u32,
-        payload_hash: &str,
-    ) -> Signature {
+    /// query parameters, with `X-Amz-Signature` last.
+    ///
+    /// For S3 the payload hash is always [`UNSIGNED_PAYLOAD`], because the
+    /// body of a presigned request is not known when the URL is made
+    /// ([query string auth](https://docs.aws.amazon.com/AmazonS3/latest/developerguide/sigv4-query-string-auth.html)).
+    /// Other services, which only the aws-c-auth vectors use, sign the
+    /// SHA-256 of the body as those vectors expect.
+    pub fn presign(&self, request: &mut Request, expires_seconds: u32) -> Signature {
+        let payload_hash = if self.service == "s3" {
+            UNSIGNED_PAYLOAD.to_owned()
+        } else {
+            sha256_hex(request.body())
+        };
         let (_, signed_headers) =
             canonical_headers(request, &|name| !UNSIGNED_HEADERS.contains(&name));
         let mut auth = vec![
@@ -346,7 +351,7 @@ impl<'a> Signer<'a> {
         if let Some(token) = self.credentials.session_token() {
             auth.push(("X-Amz-Security-Token".to_owned(), token.to_owned()));
         }
-        let (canonical, signed) = canonical_request(request, &auth, payload_hash, &|name| {
+        let (canonical, signed) = canonical_request(request, &auth, &payload_hash, &|name| {
             !UNSIGNED_HEADERS.contains(&name)
         });
         let signature = self.finish(canonical, signed);
@@ -724,6 +729,24 @@ mod tests {
     }
 
     #[test]
+    fn an_s3_presigned_request_signs_unsigned_payload() {
+        let creds = Credentials::new("AKID", "secret");
+        let time = UtcTime::parse_amz("20130524T000000Z").expect("time");
+        let signer = Signer::new(&creds, "us-east-1", "s3", time);
+        let mut request = Request::new("PUT", "/b/k")
+            .with_header("host", "h")
+            .with_body(b"data".to_vec());
+        let signature = signer.presign(&mut request, 60);
+        assert!(
+            signature
+                .canonical_request()
+                .ends_with("\nUNSIGNED-PAYLOAD"),
+            "{}",
+            signature.canonical_request()
+        );
+    }
+
+    #[test]
     fn debug_output_hides_tokens_signatures_and_credentials() {
         let creds = Credentials::new("AKIDEXAMPLE", "very-secret").with_session_token("TOKEN-TEXT");
         let time = UtcTime::parse_amz("20130524T000000Z").expect("time");
@@ -731,7 +754,7 @@ mod tests {
         let mut with_header = Request::new("GET", "/b/k").with_header("host", "h");
         let header_signature = signer.sign_request(&mut with_header, EMPTY_SHA256);
         let mut presigned = Request::new("GET", "/b/k").with_header("host", "h");
-        let query_signature = signer.presign(&mut presigned, 60, UNSIGNED_PAYLOAD);
+        let query_signature = signer.presign(&mut presigned, 60);
         let credential = format!("AKIDEXAMPLE/{}", signer.scope());
         let secrets = [
             "TOKEN-TEXT",
