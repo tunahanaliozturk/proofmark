@@ -331,9 +331,12 @@ mod tests {
 
     #[test]
     fn md5_handles_lengths_around_the_padding_boundary() {
-        // 55 bytes fits the length in the same block, 56 needs a second one.
+        // 55 bytes fits the length in the same block, 56 needs a second one,
+        // 63 is one short of a full block. The 63-byte digest was computed
+        // with Python's hashlib and with `openssl md5`, which agree.
         assert_eq!(hex(&md5(&[b'a'; 55])), "ef1772b6dff9a122358552954ad0df65");
         assert_eq!(hex(&md5(&[b'a'; 56])), "3b0c8ac703f828b04c6c197006d17218");
+        assert_eq!(hex(&md5(&[b'a'; 63])), "b06521f39153d618550606be297466d5");
         assert_eq!(hex(&md5(&[b'a'; 64])), "014842d480b571495a4a0363793f7367");
     }
 
