@@ -5,6 +5,7 @@
 //! these modules may change shape in any release. See
 //! `docs/adr/0006-library-target-for-tests-not-an-api.md`.
 
+pub mod aws_chunked;
 pub mod checksum;
 pub mod http;
 pub mod rng;
