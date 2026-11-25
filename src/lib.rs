@@ -6,5 +6,7 @@
 //! `docs/adr/0006-library-target-for-tests-not-an-api.md`.
 
 pub mod checksum;
+pub mod http;
 pub mod rng;
+pub mod sigv4;
 pub mod time;
