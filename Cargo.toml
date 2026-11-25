@@ -12,6 +12,9 @@ categories = ["command-line-utilities", "development-tools::testing"]
 exclude = ["/.github", "/docs"]
 publish = false
 
+[dependencies]
+ring = "0.17.14"
+
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
