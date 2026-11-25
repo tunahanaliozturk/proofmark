@@ -8,7 +8,7 @@ The files are compared byte for byte and have LF line ends, as upstream, so `.gi
 
 ## `tls`
 
-A throwaway CA and a server certificate for `localhost` and `127.0.0.1`, valid until 2126, used only by the TLS tests against the fake server. The CA key was deleted after signing. To make new ones:
+A throwaway CA and a server certificate for `localhost` and `127.0.0.1`, valid until 2126, used only by the TLS tests against the fake server. `tls/server.key` is a throwaway test key for `localhost` and `127.0.0.1` and protects nothing. The CA key was deleted after signing and was never committed. To make new ones:
 
 ```
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout ca.key -out ca.pem -days 36500 \

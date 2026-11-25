@@ -391,7 +391,7 @@ On 2026-11-22, `https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-streaming.
 
 ### HTTP details stores get wrong
 
-Interim `100 Continue`, chunked responses, `HEAD` with a `Content-Length` and no body, keys that need careful percent-encoding in both the path and the canonical request. The client handles each, and each has a fake-server test. The response parser is fuzzed with arbitrary bytes from M1: a hostile or broken endpoint must not make proofmark panic or hang.
+Interim `100 Continue`, chunked responses, `HEAD` with a `Content-Length` and no body, keys that need careful percent-encoding in both the path and the canonical request. The client handles each, and each has a fake-server test. Other interim responses (`102`, `103`) are skipped; `101 Switching Protocols` is an error, because the client speaks only HTTP/1.1. In the canonical request an escaped `/` inside a key (`%2F`) stays escaped, since S3 treats it as part of the key, and presigned S3 URLs are always signed over `UNSIGNED-PAYLOAD`. The response parser is fuzzed with arbitrary bytes from M1: a hostile or broken endpoint must not make proofmark panic or hang.
 
 ### Store-specific set-up
 
@@ -425,12 +425,12 @@ All `cargo test` runs work offline. Network use is loopback to the fake only.
 
 ## Security considerations
 
-- Credentials come from the environment and are never printed, written to a report or the ledger, or included in an error message. `Authorization` headers, `X-Amz-Signature` query values, `X-Amz-Security-Token` and `x-amz-security-token` are redacted in `--verbose` output and in the exchanges recorded in reports. A test greps every output format for a planted secret.
-- TLS verification is always on, using the operating system's trust store (rustls-native-certs) plus `--ca-file`. There is no switch to turn it off.
+- Credentials come from the environment and are never printed, written to a report or the ledger, or included in an error message. `Authorization` headers, `X-Amz-Signature` and `X-Amz-Credential` query values, `X-Amz-Security-Token` and `x-amz-security-token` are redacted in `--verbose` output and in the exchanges recorded in reports. The `Debug` output of a request and of a signature already hides them (M1). A test greps every output format for a planted secret.
+- TLS verification is always on, using the operating system's trust store (rustls-native-certs) plus `--ca-file`. There is no switch to turn it off. The HTTP client only takes a TLS configuration it built itself from those roots; a caller cannot hand it a rustls configuration with a verifier of its own. If a later milestone needs to probe a store whose self-signed certificate has no CA to pass with `--ca-file`, that will be a separate option with its own name, and every report from a run that used it will say so. It is not planned.
 - Reports contain the endpoint URL, bucket names and request ids. They contain no object data beyond sizes and checksums.
 - The data-safety rules are in [ADR 0004](adr/0004-only-touch-what-it-wrote.md). The ledger contains bucket names, keys and version ids, nothing secret.
-- proofmark trusts nothing from the endpoint: response sizes are capped (bodies proofmark did not write are read up to a limit), and every read has a timeout.
-- `proofmark fake` listens on `127.0.0.1` by default, accepts one fixed test key pair, and prints a warning if told to listen elsewhere. It is a test tool and keeps everything in memory.
+- proofmark trusts nothing from the endpoint: response sizes are capped (bodies proofmark did not write are read up to a limit), and each exchange has one deadline, from the name lookup to the last byte of the response. `std` has no timeout for name lookups, so the lookup runs on a helper thread and the client stops waiting for it at the deadline; a lookup still running then is left to finish on its own, so that thread can outlive the call. Under TLS, every socket read and write that rustls makes gets the time left, not a timeout set once per TLS call.
+- `proofmark fake` listens on `127.0.0.1` by default, accepts one fixed test key pair, and refuses any address that is not a loopback address. It is a test tool and keeps everything in memory.
 - The race probes send at most 64 concurrent requests. proofmark is not a load generator and must not be usable as one; there is no option to loop.
 
 ## Dependencies
