@@ -17,12 +17,16 @@ use std::time::{Duration, Instant};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName};
 
-use crate::sigv4::{encode_component, percent_decode};
+use crate::sigv4::{REDACTED, encode_component, is_secret_name, percent_decode};
 
 pub(crate) use wire::{Wire, request_framing};
 
 /// One request, exactly as it will be sent.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` hides the values of the `Authorization` header, the session
+/// token and the presigned signature and credential, and shows the body's
+/// length rather than its bytes.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Request {
     method: String,
     path: String,
@@ -176,6 +180,31 @@ impl Request {
         }
         head.push_str("\r\n");
         Ok(head.into_bytes())
+    }
+}
+
+impl fmt::Debug for Request {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let redact = |pairs: &[(String, String)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(name, value)| {
+                    let shown = if is_secret_name(name) {
+                        REDACTED
+                    } else {
+                        value
+                    };
+                    (name.clone(), shown.to_owned())
+                })
+                .collect()
+        };
+        f.debug_struct("Request")
+            .field("method", &self.method)
+            .field("path", &self.path)
+            .field("query", &redact(&self.query))
+            .field("headers", &redact(&self.headers))
+            .field("body_len", &self.body.len())
+            .finish()
     }
 }
 

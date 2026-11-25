@@ -94,18 +94,64 @@ impl fmt::Debug for Credentials {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Credentials")
             .field("access_key_id", &self.access_key_id)
-            .field("secret_access_key", &"<redacted>")
+            .field("secret_access_key", &REDACTED)
             .field(
                 "session_token",
-                &self.session_token.as_ref().map(|_| "<redacted>"),
+                &self.session_token.as_ref().map(|_| REDACTED),
             )
             .finish()
     }
 }
 
+/// What `Debug` output shows in place of a secret.
+pub(crate) const REDACTED: &str = "<redacted>";
+
+/// True for a header or query parameter whose value is a secret or a proof
+/// that can be replayed: the session token, the signature and the
+/// credential, in their header and presigned forms. Ignores case.
+pub(crate) fn is_secret_name(name: &str) -> bool {
+    [
+        "authorization",
+        "x-amz-security-token",
+        "x-amz-signature",
+        "x-amz-credential",
+    ]
+    .iter()
+    .any(|secret| name.eq_ignore_ascii_case(secret))
+}
+
+/// A canonical request with the value of every secret header line and
+/// every secret pair on the query line replaced.
+fn redact_canonical(canonical: &str) -> String {
+    let lines: Vec<String> = canonical
+        .split('\n')
+        .enumerate()
+        .map(|(i, line)| {
+            if i == 2 {
+                let pairs: Vec<String> = line
+                    .split('&')
+                    .map(|pair| match pair.split_once('=') {
+                        Some((key, _)) if is_secret_name(key) => format!("{key}={REDACTED}"),
+                        _ => pair.to_owned(),
+                    })
+                    .collect();
+                return pairs.join("&");
+            }
+            match line.split_once(':') {
+                Some((name, _)) if is_secret_name(name) => format!("{name}:{REDACTED}"),
+                _ => line.to_owned(),
+            }
+        })
+        .collect();
+    lines.join("\n")
+}
+
 /// The intermediate and final values of one signature, so that tests can
 /// compare each step with published vectors.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` leaves out the signature and hides any token or credential in
+/// the canonical request.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Signature {
     canonical_request: String,
     string_to_sign: String,
@@ -136,6 +182,19 @@ impl Signature {
     #[must_use]
     pub fn signature(&self) -> &str {
         &self.hex
+    }
+}
+
+impl fmt::Debug for Signature {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Signature")
+            .field(
+                "canonical_request",
+                &redact_canonical(&self.canonical_request),
+            )
+            .field("string_to_sign", &self.string_to_sign)
+            .field("signed_headers", &self.signed_headers)
+            .finish_non_exhaustive()
     }
 }
 
@@ -662,6 +721,35 @@ mod tests {
         assert!(shown.contains("AKID"));
         assert!(!shown.contains("very-secret"));
         assert!(!shown.contains("token-value"));
+    }
+
+    #[test]
+    fn debug_output_hides_tokens_signatures_and_credentials() {
+        let creds = Credentials::new("AKIDEXAMPLE", "very-secret").with_session_token("TOKEN-TEXT");
+        let time = UtcTime::parse_amz("20130524T000000Z").expect("time");
+        let signer = Signer::new(&creds, "us-east-1", "s3", time);
+        let mut with_header = Request::new("GET", "/b/k").with_header("host", "h");
+        let header_signature = signer.sign_request(&mut with_header, EMPTY_SHA256);
+        let mut presigned = Request::new("GET", "/b/k").with_header("host", "h");
+        let query_signature = signer.presign(&mut presigned, 60, UNSIGNED_PAYLOAD);
+        let credential = format!("AKIDEXAMPLE/{}", signer.scope());
+        let secrets = [
+            "TOKEN-TEXT",
+            header_signature.signature(),
+            query_signature.signature(),
+            &credential,
+            &encode_component(credential.as_bytes()),
+        ];
+        for shown in [
+            format!("{with_header:?}"),
+            format!("{header_signature:?}"),
+            format!("{presigned:?}"),
+            format!("{query_signature:?}"),
+        ] {
+            for secret in secrets {
+                assert!(!shown.contains(secret), "{secret:?} in {shown}");
+            }
+        }
     }
 
     #[test]
