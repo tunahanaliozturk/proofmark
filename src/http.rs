@@ -10,8 +10,9 @@ mod wire;
 
 use std::fmt;
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::Arc;
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::{Arc, mpsc};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use rustls::pki_types::pem::PemObject;
@@ -715,9 +716,16 @@ impl Client {
 }
 
 fn connect(endpoint: &Endpoint, deadline: Instant) -> Result<TcpStream, HttpError> {
-    let addrs = (endpoint.host.as_str(), endpoint.port)
-        .to_socket_addrs()
-        .map_err(HttpError::Connect)?;
+    let (host, port) = (endpoint.host.clone(), endpoint.port);
+    let addrs = if let Ok(ip) = host.parse::<IpAddr>() {
+        vec![SocketAddr::new(ip, port)]
+    } else {
+        resolve(deadline, move || {
+            (host.as_str(), port)
+                .to_socket_addrs()
+                .map(Iterator::collect)
+        })?
+    };
     let mut last = io::Error::new(io::ErrorKind::NotFound, "the host resolved to no address");
     for addr in addrs {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -733,6 +741,32 @@ fn connect(endpoint: &Endpoint, deadline: Instant) -> Result<TcpStream, HttpErro
         }
     }
     Err(HttpError::Connect(last))
+}
+
+/// Runs the name lookup `lookup` on a helper thread and waits for it until
+/// `deadline`. `std` has no resolver timeout, so a lookup that is still
+/// running at the deadline is left to finish on its own; its thread
+/// outlives the call and its answer is dropped.
+fn resolve<F>(deadline: Instant, lookup: F) -> Result<Vec<SocketAddr>, HttpError>
+where
+    F: FnOnce() -> io::Result<Vec<SocketAddr>> + Send + 'static,
+{
+    let (send, receive) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("proofmark-resolve".to_owned())
+        .spawn(move || {
+            // The caller may have stopped waiting; nobody to tell.
+            let _ = send.send(lookup());
+        })
+        .map_err(HttpError::Connect)?;
+    let left = deadline.saturating_duration_since(Instant::now());
+    match receive.recv_timeout(left) {
+        Ok(result) => result.map_err(HttpError::Connect),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(HttpError::TimedOut),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(HttpError::Connect(io::Error::other(
+            "the name lookup thread stopped without an answer",
+        ))),
+    }
 }
 
 /// Parses one complete response from `input`, as the client would after
@@ -833,6 +867,21 @@ mod tests {
                 "{request:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_slow_name_lookup_stops_at_the_deadline() {
+        let started = Instant::now();
+        let result = resolve(started + Duration::from_millis(200), || {
+            thread::sleep(Duration::from_secs(3));
+            Ok(Vec::new())
+        });
+        assert!(matches!(result, Err(HttpError::TimedOut)), "{result:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
