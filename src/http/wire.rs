@@ -239,7 +239,11 @@ impl<R: Read> Wire<R> {
         let mut out = Vec::new();
         loop {
             let line = self.line()?;
-            let Ok(httparse::Status::Complete((_, size))) = httparse::parse_chunk_size(&line)
+            // httparse reads a size with no digits as 0; the grammar is
+            // `1*HEXDIG` (RFC 9112, section 7.1).
+            let has_digit = line.first().is_some_and(u8::is_ascii_hexdigit);
+            let (true, Ok(httparse::Status::Complete((_, size)))) =
+                (has_digit, httparse::parse_chunk_size(&line))
             else {
                 return Err(HttpError::Malformed("chunk size line".to_owned()));
             };
@@ -470,6 +474,20 @@ mod tests {
         let trailer = padded(b"0\r\nx-trailer: ", MAX_LINE + 10, b"\r\n\r\n");
         let result = Wire::new(&trailer[..]).body(Framing::Chunked, 1024);
         assert!(matches!(result, Err(HttpError::Malformed(_))), "{result:?}");
+    }
+
+    #[test]
+    fn a_chunk_size_line_without_a_hex_digit_is_refused() {
+        // RFC 9112, 7.1: chunk-size = 1*HEXDIG. An empty line or a bare
+        // extension must not end the body as if it were the last chunk.
+        for input in [&b"\r\n\r\n"[..], b";ext=1\r\n\r\n", b"\n\r\n"] {
+            let result = Wire::new(input).body(Framing::Chunked, 1024);
+            assert!(
+                matches!(result, Err(HttpError::Malformed(_))),
+                "{:?}: {result:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
     }
 
     #[test]
