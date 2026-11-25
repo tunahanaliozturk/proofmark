@@ -4,11 +4,15 @@
 #![cfg(test)]
 
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use proofmark::aws_chunked;
 use proofmark::checksum::{hex, md5, sha256_hex};
@@ -200,7 +204,7 @@ fn a_wrong_secret_with_expect_continue_is_refused_before_the_body() {
         head = head + name + ": " + value + "\r\n";
     }
     head.push_str("\r\n");
-    let mut raw = std::net::TcpStream::connect(server.addr()).expect("connect");
+    let mut raw = TcpStream::connect(server.addr()).expect("connect");
     raw.set_read_timeout(Some(Duration::from_secs(5)))
         .expect("timeout");
     raw.write_all(head.as_bytes()).expect("write head");
@@ -328,6 +332,107 @@ fn a_silent_server_times_out() {
         started.elapsed()
     );
     holder.join().expect("holder thread");
+}
+
+/// Sends `bytes` one at a time, 50 ms apart, for at most `limit`. Each byte
+/// arrives well inside the client's timeout, so only a deadline over the
+/// whole exchange stops the client.
+fn trickle(tcp: &mut TcpStream, bytes: &[u8], limit: Duration) {
+    let started = Instant::now();
+    for byte in bytes {
+        if started.elapsed() > limit || tcp.write_all(&[*byte]).is_err() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Sends a GET over TLS with a `timeout` deadline and returns the result
+/// and how long it took.
+fn tls_get(
+    addr: std::net::SocketAddr,
+    timeout: Duration,
+) -> (Result<Response, HttpError>, Duration) {
+    let endpoint = Endpoint::parse(&format!("https://{addr}")).expect("endpoint");
+    let client = Client::new()
+        .with_tls(tls_config_with_roots(&fixture("ca.pem")).expect("roots"))
+        .with_timeout(timeout);
+    let started = Instant::now();
+    let result = client.send(
+        &endpoint,
+        &Request::new("GET", "/").with_header("host", &endpoint.authority()),
+    );
+    (result, started.elapsed())
+}
+
+#[test]
+fn a_tls_peer_that_trickles_the_handshake_times_out_at_the_deadline() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let peer = thread::spawn(move || {
+        let (mut tcp, _) = listener.accept().expect("accept");
+        let mut hello = [0u8; 4096];
+        let _ = tcp.read(&mut hello);
+        // A handshake record header that promises 16 KiB, then its body
+        // one byte at a time.
+        let _ = tcp.write_all(&[0x16, 0x03, 0x03, 0x40, 0x00]);
+        trickle(&mut tcp, &[0u8; 0x4000], Duration::from_secs(4));
+    });
+    let (result, took) = tls_get(addr, Duration::from_millis(500));
+    assert!(matches!(result, Err(HttpError::TimedOut)), "{result:?}");
+    assert!(took < Duration::from_millis(1500), "took {took:?}");
+    peer.join().expect("peer thread");
+}
+
+#[test]
+fn a_tls_peer_that_trickles_the_body_times_out_at_the_deadline() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("versions")
+    .with_no_client_auth()
+    .with_single_cert(
+        CertificateDer::pem_slice_iter(&fixture("server.pem"))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("chain"),
+        PrivateKeyDer::from_pem_slice(&fixture("server.key")).expect("key"),
+    )
+    .expect("server config");
+    let peer = thread::spawn(move || {
+        let (mut tcp, _) = listener.accept().expect("accept");
+        let mut tls = rustls::ServerConnection::new(Arc::new(config)).expect("session");
+        while tls.is_handshaking() {
+            tls.complete_io(&mut tcp).expect("handshake");
+        }
+        let mut request = Vec::new();
+        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+            tls.complete_io(&mut tcp).expect("read the request");
+            let mut buf = [0u8; 1024];
+            match tls.reader().read(&mut buf) {
+                Ok(n) => request.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("{e}"),
+            }
+        }
+        tls.writer()
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n")
+            .expect("head");
+        tls.complete_io(&mut tcp).expect("send the head");
+        // The body as one TLS record, sent a byte at a time.
+        tls.writer().write_all(&[b'a'; 1000]).expect("body");
+        let mut record = Vec::new();
+        while tls.wants_write() {
+            tls.write_tls(&mut record).expect("encrypt");
+        }
+        trickle(&mut tcp, &record, Duration::from_secs(4));
+    });
+    let (result, took) = tls_get(addr, Duration::from_secs(1));
+    assert!(matches!(result, Err(HttpError::TimedOut)), "{result:?}");
+    assert!(took < Duration::from_secs(2), "took {took:?}");
+    peer.join().expect("peer thread");
 }
 
 #[test]

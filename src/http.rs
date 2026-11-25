@@ -521,56 +521,82 @@ fn build_client_config(
     Ok(Arc::new(config))
 }
 
-enum Conn {
-    Plain(TcpStream),
-    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
-}
-
-/// A connection whose every read and write must finish by `deadline`.
-struct Timed {
-    conn: Conn,
+/// A TCP stream whose every read and write must finish by `deadline`.
+///
+/// Under TLS it sits below rustls, so each socket read or write that rustls
+/// makes inside one TLS read or write gets the time left at that moment. A
+/// timeout set once before the TLS call would be applied afresh to every
+/// socket operation, and a peer that sends one byte at a time could hold
+/// the exchange open far past its deadline.
+struct TimedTcp {
+    tcp: TcpStream,
     deadline: Instant,
 }
 
-impl Timed {
+impl TimedTcp {
     fn arm(&self) -> io::Result<()> {
         let left = self.deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return Err(io::ErrorKind::TimedOut.into());
         }
-        let tcp = match &self.conn {
-            Conn::Plain(tcp) => tcp,
-            Conn::Tls(tls) => &tls.sock,
-        };
-        tcp.set_read_timeout(Some(left))?;
-        tcp.set_write_timeout(Some(left))
+        self.tcp.set_read_timeout(Some(left))?;
+        self.tcp.set_write_timeout(Some(left))
     }
 }
 
-impl Read for Timed {
+impl Read for TimedTcp {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.arm()?;
-        match &mut self.conn {
-            Conn::Plain(tcp) => tcp.read(buf),
-            Conn::Tls(tls) => tls.read(buf),
+        self.tcp.read(buf)
+    }
+}
+
+impl Write for TimedTcp {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.arm()?;
+        self.tcp.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.tcp.flush()
+    }
+}
+
+enum Conn {
+    Plain(TimedTcp),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TimedTcp>>),
+}
+
+impl Conn {
+    fn set_deadline(&mut self, deadline: Instant) {
+        match self {
+            Self::Plain(tcp) => tcp.deadline = deadline,
+            Self::Tls(tls) => tls.sock.deadline = deadline,
         }
     }
 }
 
-impl Write for Timed {
+impl Read for Conn {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(tcp) => tcp.read(buf),
+            Self::Tls(tls) => tls.read(buf),
+        }
+    }
+}
+
+impl Write for Conn {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.arm()?;
-        match &mut self.conn {
-            Conn::Plain(tcp) => tcp.write(buf),
-            Conn::Tls(tls) => tls.write(buf),
+        match self {
+            Self::Plain(tcp) => tcp.write(buf),
+            Self::Tls(tls) => tls.write(buf),
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.arm()?;
-        match &mut self.conn {
-            Conn::Plain(tcp) => tcp.flush(),
-            Conn::Tls(tls) => tls.flush(),
+        match self {
+            Self::Plain(tcp) => tcp.flush(),
+            Self::Tls(tls) => tls.flush(),
         }
     }
 }
@@ -648,8 +674,11 @@ impl Client {
     pub fn send(&self, endpoint: &Endpoint, request: &Request) -> Result<Response, HttpError> {
         let deadline = Instant::now() + self.timeout;
         let head = request.head_bytes()?;
-        let tcp = connect(endpoint, deadline)?;
-        let conn = match endpoint.scheme {
+        let tcp = TimedTcp {
+            tcp: connect(endpoint, deadline)?,
+            deadline,
+        };
+        let mut conn = match endpoint.scheme {
             Scheme::Http => Conn::Plain(tcp),
             Scheme::Https => {
                 let config = self.tls.as_ref().ok_or(HttpError::TlsNotConfigured)?;
@@ -660,19 +689,19 @@ impl Client {
                 Conn::Tls(Box::new(rustls::StreamOwned::new(session, tcp)))
             }
         };
-        let mut timed = Timed { conn, deadline };
         let expects_continue = request
             .header("expect")
             .is_some_and(|v| v.trim().eq_ignore_ascii_case("100-continue"));
-        timed.write_all(&head)?;
+        conn.write_all(&head)?;
         if !expects_continue {
-            timed.write_all(&request.body)?;
+            conn.write_all(&request.body)?;
         }
-        timed.flush()?;
-        let mut wire = Wire::new(timed);
+        conn.flush()?;
+        let mut wire = Wire::new(conn);
 
         if expects_continue {
-            wire.get_mut().deadline = deadline.min(Instant::now() + self.continue_wait);
+            wire.get_mut()
+                .set_deadline(deadline.min(Instant::now() + self.continue_wait));
             let early = loop {
                 match wire.response_head() {
                     Ok(head) if head.status == 100 => break None,
@@ -682,7 +711,7 @@ impl Client {
                     Err(e) => return Err(e),
                 }
             };
-            wire.get_mut().deadline = deadline;
+            wire.get_mut().set_deadline(deadline);
             if let Some(head) = early {
                 return self.finish(&mut wire, request, head);
             }
