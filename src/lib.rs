@@ -7,6 +7,7 @@
 
 pub mod aws_chunked;
 pub mod checksum;
+pub mod cli;
 pub mod fake;
 pub mod http;
 pub mod ledger;
