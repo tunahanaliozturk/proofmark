@@ -99,6 +99,11 @@ impl Credentials {
     pub fn session_token(&self) -> Option<&str> {
         self.session_token.as_deref()
     }
+
+    /// The secret key, so that output can be searched for it and scrubbed.
+    pub(crate) fn secret_access_key(&self) -> &str {
+        &self.secret_access_key
+    }
 }
 
 impl fmt::Debug for Credentials {

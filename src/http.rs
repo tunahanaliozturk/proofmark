@@ -127,8 +127,17 @@ impl Request {
     /// way S3 sub-resources such as `?uploads` are written.
     #[must_use]
     pub fn target(&self) -> String {
+        self.render_target(false)
+    }
+
+    fn render_target(&self, redact: bool) -> String {
         let mut target = self.path.clone();
         for (i, (key, value)) in self.query.iter().enumerate() {
+            let value = if redact && is_secret_name(key) {
+                REDACTED
+            } else {
+                value
+            };
             target.push(if i == 0 { '?' } else { '&' });
             target.push_str(&encode_component(key.as_bytes()));
             if !value.is_empty() {
@@ -137,6 +146,14 @@ impl Request {
             }
         }
         target
+    }
+
+    /// The request target with the value of every secret query parameter
+    /// (the presigned signature, credential and session token) replaced, for
+    /// logs and reports.
+    #[must_use]
+    pub fn redacted_target(&self) -> String {
+        self.render_target(true)
     }
 
     /// Splits a request target as received into a path and decoded query

@@ -30,6 +30,7 @@ use crate::checksum::{base64, hex, md5, sha256, sha256_hex};
 use crate::http::{
     Endpoint, HttpError, Request, Response, Scheme, Wire, crypto_provider, request_framing,
 };
+use crate::s3::xml_escape;
 use crate::sigv4::{
     Authorization, Credentials, STREAMING_SIGNED, STREAMING_SIGNED_TRAILER,
     STREAMING_UNSIGNED_TRAILER, Signature, Signer, UNSIGNED_PAYLOAD,
@@ -583,21 +584,6 @@ impl S3Error {
             body.into_bytes(),
         )
     }
-}
-
-fn xml_escape(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&apos;"),
-            _ => out.push(c),
-        }
-    }
-    out
 }
 
 /// What a valid signature established, kept to check chunk signatures.
