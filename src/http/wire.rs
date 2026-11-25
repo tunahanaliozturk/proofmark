@@ -121,7 +121,9 @@ impl<R: Read> Wire<R> {
     }
 
     /// Reads one response head. Interim (`1xx`) responses are returned like
-    /// any other; the caller decides what to do with them.
+    /// any other; the caller decides what to do with them. The exception is
+    /// `101 Switching Protocols`, an error here: after it the connection
+    /// speaks another protocol, which this client does not.
     pub(crate) fn response_head(&mut self) -> Result<ResponseHead, HttpError> {
         loop {
             let mut fields = [httparse::EMPTY_HEADER; MAX_HEADERS];
@@ -141,6 +143,11 @@ impl<R: Read> Wire<R> {
                 self.pos += len;
                 if !(100..=999).contains(&head.status) {
                     return Err(HttpError::Malformed(format!("status {}", head.status)));
+                }
+                if head.status == 101 {
+                    return Err(HttpError::Malformed(
+                        "101 Switching Protocols; this client only speaks HTTP/1.1".to_owned(),
+                    ));
                 }
                 return Ok(head);
             }

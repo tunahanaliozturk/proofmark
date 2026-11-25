@@ -857,9 +857,18 @@ mod tests {
 
     #[test]
     fn skips_interim_responses() {
-        let input = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let input = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 102 Processing\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
         let response = parse_response(&input[..], "PUT", 1024).expect("parses");
         assert_eq!((response.status(), response.body()), (200, &b"ok"[..]));
+    }
+
+    #[test]
+    fn a_switching_protocols_response_is_an_error() {
+        // After a 101 the connection speaks another protocol, so what
+        // follows is not an HTTP/1.1 response to wait for (RFC 9110, 15.2.2).
+        let input = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\nConnection: Upgrade\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let result = parse_response(&input[..], "GET", 1024);
+        assert!(matches!(result, Err(HttpError::Malformed(_))), "{result:?}");
     }
 
     #[test]
