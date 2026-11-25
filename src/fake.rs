@@ -8,7 +8,7 @@
 //! catch them (M2 onwards).
 //!
 //! One global lock, no persistence, one request per connection. Listens on
-//! loopback unless told otherwise.
+//! loopback only.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -148,12 +148,21 @@ impl FakeServer {
         Self::bind(SocketAddr::from(([127, 0, 0, 1], 0)), config)
     }
 
-    /// Starts a server on `addr`.
+    /// Starts a server on `addr`, which must be a loopback address. The
+    /// fake accepts a published key pair, so it never listens where another
+    /// machine could reach it.
     ///
     /// # Errors
     ///
-    /// The I/O error if the socket cannot be bound or the thread started.
+    /// [`io::ErrorKind::InvalidInput`] if `addr` is not a loopback address,
+    /// or the I/O error if the socket cannot be bound or the thread started.
     pub fn bind(addr: SocketAddr, config: FakeConfig) -> io::Result<Self> {
+        if !addr.ip().is_loopback() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("the fake listens only on loopback addresses, not {addr}"),
+            ));
+        }
         let listener = TcpListener::bind(addr)?;
         let addr = listener.local_addr()?;
         let scheme = if config.tls.is_some() {
@@ -201,13 +210,9 @@ impl FakeServer {
 impl Drop for FakeServer {
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::SeqCst);
-        let mut wake = self.addr;
-        if wake.ip().is_unspecified() {
-            wake.set_ip([127, 0, 0, 1].into());
-        }
         // Wakes the blocking accept so the thread sees the flag. If the
         // connect fails, the thread is left to end with the process.
-        if TcpStream::connect_timeout(&wake, Duration::from_secs(1)).is_ok()
+        if TcpStream::connect_timeout(&self.addr, Duration::from_secs(1)).is_ok()
             && let Some(accept) = self.accept.take()
         {
             // A panic in the accept thread has already been reported.

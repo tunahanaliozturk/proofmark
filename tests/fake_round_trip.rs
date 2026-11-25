@@ -310,6 +310,17 @@ fn the_client_refuses_a_certificate_it_does_not_trust() {
 }
 
 #[test]
+fn the_fake_refuses_to_listen_beyond_loopback() {
+    for addr in ["192.0.2.1:0", "0.0.0.0:0", "[::]:0"] {
+        let result = FakeServer::bind(addr.parse().expect("address"), FakeConfig::new());
+        assert!(
+            matches!(&result, Err(e) if e.kind() == std::io::ErrorKind::InvalidInput),
+            "{addr}: {result:?}"
+        );
+    }
+}
+
+#[test]
 fn a_silent_server_times_out() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
