@@ -1,2 +1,4 @@
 * text=auto eol=lf
 *.png binary
+# Test vectors are compared byte for byte; keep their line ends as they are.
+tests/fixtures/** -text
