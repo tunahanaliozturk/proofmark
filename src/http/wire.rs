@@ -55,6 +55,10 @@ pub(crate) struct Wire<R> {
     pos: usize,
 }
 
+fn too_long(what: &str, limit: usize) -> HttpError {
+    HttpError::Malformed(format!("{what} longer than {limit} bytes"))
+}
+
 fn owned_headers(headers: &[httparse::Header<'_>]) -> Vec<(String, String)> {
     headers
         .iter()
@@ -109,9 +113,7 @@ impl<R: Read> Wire<R> {
 
     fn need_more(&mut self, limit: usize, what: &'static str) -> Result<(), HttpError> {
         if self.available().len() > limit {
-            return Err(HttpError::Malformed(format!(
-                "{what} longer than {limit} bytes"
-            )));
+            return Err(too_long(what, limit));
         }
         if self.fill()? {
             Ok(())
@@ -140,6 +142,9 @@ impl<R: Read> Wire<R> {
                 Err(e) => return Err(HttpError::Malformed(format!("response head: {e}"))),
             };
             if let Some((len, head)) = parsed {
+                if len > MAX_HEAD {
+                    return Err(too_long("response head", MAX_HEAD));
+                }
                 self.pos += len;
                 if !(100..=999).contains(&head.status) {
                     return Err(HttpError::Malformed(format!("status {}", head.status)));
@@ -173,6 +178,9 @@ impl<R: Read> Wire<R> {
                 Err(e) => return Err(HttpError::Malformed(format!("request head: {e}"))),
             };
             if let Some((len, head)) = parsed {
+                if len > MAX_HEAD {
+                    return Err(too_long("request head", MAX_HEAD));
+                }
                 self.pos += len;
                 return Ok(head);
             }
@@ -184,6 +192,9 @@ impl<R: Read> Wire<R> {
     fn line(&mut self) -> Result<Vec<u8>, HttpError> {
         loop {
             if let Some(end) = self.available().iter().position(|&b| b == b'\n') {
+                if end + 1 > MAX_LINE {
+                    return Err(too_long("line", MAX_LINE));
+                }
                 let line = self.available()[..=end].to_vec();
                 self.pos += end + 1;
                 return Ok(line);
@@ -426,6 +437,39 @@ mod tests {
             wire.body(Framing::Chunked, 100).ok(),
             Some(b"hello world".to_vec())
         );
+    }
+
+    /// `prefix`, padded with `x` to `len` bytes, then `suffix`.
+    fn padded(prefix: &[u8], len: usize, suffix: &[u8]) -> Vec<u8> {
+        let mut out = prefix.to_vec();
+        out.resize(len, b'x');
+        out.extend_from_slice(suffix);
+        out
+    }
+
+    #[test]
+    fn a_head_over_the_limit_is_refused_even_when_it_arrives_complete() {
+        // The terminator arrives in the same read that crosses the limit.
+        let response = padded(
+            b"HTTP/1.1 200 OK\r\nx-big: ",
+            MAX_HEAD + 100,
+            b"\r\nContent-Length: 0\r\n\r\n",
+        );
+        let result = Wire::new(&response[..]).response_head();
+        assert!(matches!(result, Err(HttpError::Malformed(_))), "{result:?}");
+        let request = padded(b"PUT /b/k HTTP/1.1\r\nx-big: ", MAX_HEAD + 100, b"\r\n\r\n");
+        let result = Wire::new(&request[..]).request_head();
+        assert!(matches!(result, Err(HttpError::Malformed(_))), "{result:?}");
+    }
+
+    #[test]
+    fn a_line_over_the_limit_is_refused_even_when_it_arrives_complete() {
+        let chunk_size = padded(b"1;", MAX_LINE + 10, b"\r\na\r\n0\r\n\r\n");
+        let result = Wire::new(&chunk_size[..]).body(Framing::Chunked, 1024);
+        assert!(matches!(result, Err(HttpError::Malformed(_))), "{result:?}");
+        let trailer = padded(b"0\r\nx-trailer: ", MAX_LINE + 10, b"\r\n\r\n");
+        let result = Wire::new(&trailer[..]).body(Framing::Chunked, 1024);
+        assert!(matches!(result, Err(HttpError::Malformed(_))), "{result:?}");
     }
 
     #[test]
