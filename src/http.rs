@@ -161,21 +161,23 @@ impl Request {
     }
 
     fn head_bytes(&self) -> Result<Vec<u8>, HttpError> {
-        let bad = |s: &str| s.bytes().any(|b| b == b'\r' || b == b'\n');
+        // The query is percent-encoded by `target`, so only these can carry
+        // a raw CR, LF or NUL.
+        let bad = |s: &str| s.bytes().any(|b| matches!(b, b'\r' | b'\n' | b'\0'));
         if bad(&self.method)
             || self.method.contains(' ')
             || bad(&self.path)
             || self.path.contains(' ')
         {
             return Err(HttpError::InvalidRequest(
-                "method or path contains a space or line break",
+                "method or path contains a space, line break or NUL",
             ));
         }
         let mut head = format!("{} {} HTTP/1.1\r\n", self.method, self.target());
         for (name, value) in &self.headers {
             if bad(name) || bad(value) || name.contains(':') || name.is_empty() {
                 return Err(HttpError::InvalidRequest(
-                    "header contains a line break or bad name",
+                    "header contains a line break, NUL or bad name",
                 ));
             }
             head.push_str(name);
@@ -816,6 +818,21 @@ mod tests {
             request.head_bytes(),
             Err(HttpError::InvalidRequest(_))
         ));
+    }
+
+    #[test]
+    fn refuses_nul_anywhere_in_the_head() {
+        for request in [
+            Request::new("GET", "/").with_header("x", "a\0b"),
+            Request::new("GET", "/").with_header("x\0y", "a"),
+            Request::new("GET", "/a\0b"),
+            Request::new("GE\0T", "/"),
+        ] {
+            assert!(
+                matches!(request.head_bytes(), Err(HttpError::InvalidRequest(_))),
+                "{request:?}"
+            );
+        }
     }
 
     #[test]
