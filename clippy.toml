@@ -3,3 +3,5 @@ allow-expect-in-tests = true
 allow-panic-in-tests = true
 # Names that are words in this project, not code.
 doc-valid-idents = ["SigV4", "SplitMix64", "CRC64NVME", ".."]
+# ring needs windows-sys 0.52 and schannel needs 0.61; neither can move.
+allowed-duplicate-crates = ["windows-sys"]
