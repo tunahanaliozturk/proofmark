@@ -463,15 +463,19 @@ impl fmt::Display for Endpoint {
     }
 }
 
+/// A TLS client configuration, built only by [`tls_config_native`] and
+/// [`tls_config_with_roots`]. Both verify the server's certificate against
+/// trusted roots; there is no way to make one that skips verification.
+#[derive(Debug, Clone)]
+pub struct TlsConfig(Arc<rustls::ClientConfig>);
+
 /// A TLS client configuration that trusts the operating system's roots
 /// and, if given, the certificates in `extra_ca_pem`.
 ///
 /// # Errors
 ///
 /// [`HttpError::TlsConfig`] if `extra_ca_pem` holds no usable certificate.
-pub fn tls_config_native(
-    extra_ca_pem: Option<&[u8]>,
-) -> Result<Arc<rustls::ClientConfig>, HttpError> {
+pub fn tls_config_native(extra_ca_pem: Option<&[u8]>) -> Result<TlsConfig, HttpError> {
     let mut roots = rustls::RootCertStore::empty();
     let native = rustls_native_certs::load_native_certs();
     roots.add_parsable_certificates(native.certs);
@@ -487,7 +491,7 @@ pub fn tls_config_native(
 /// # Errors
 ///
 /// [`HttpError::TlsConfig`] if `ca_pem` holds no usable certificate.
-pub fn tls_config_with_roots(ca_pem: &[u8]) -> Result<Arc<rustls::ClientConfig>, HttpError> {
+pub fn tls_config_with_roots(ca_pem: &[u8]) -> Result<TlsConfig, HttpError> {
     let mut roots = rustls::RootCertStore::empty();
     add_pem(&mut roots, ca_pem)?;
     build_client_config(roots)
@@ -510,15 +514,13 @@ pub(crate) fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
-fn build_client_config(
-    roots: rustls::RootCertStore,
-) -> Result<Arc<rustls::ClientConfig>, HttpError> {
+fn build_client_config(roots: rustls::RootCertStore) -> Result<TlsConfig, HttpError> {
     let config = rustls::ClientConfig::builder_with_provider(crypto_provider())
         .with_safe_default_protocol_versions()
         .map_err(|e| HttpError::TlsConfig(e.to_string()))?
         .with_root_certificates(roots)
         .with_no_client_auth();
-    Ok(Arc::new(config))
+    Ok(TlsConfig(Arc::new(config)))
 }
 
 /// A TCP stream whose every read and write must finish by `deadline`.
@@ -607,7 +609,7 @@ pub struct Client {
     timeout: Duration,
     continue_wait: Duration,
     max_body: usize,
-    tls: Option<Arc<rustls::ClientConfig>>,
+    tls: Option<TlsConfig>,
 }
 
 impl Default for Client {
@@ -653,8 +655,25 @@ impl Client {
     }
 
     /// The same client, able to reach `https` endpoints.
+    ///
+    /// The configuration comes only from [`tls_config_native`] or
+    /// [`tls_config_with_roots`]. A rustls configuration built by the
+    /// caller, which could carry a verifier that accepts any certificate,
+    /// is not accepted:
+    ///
+    /// ```compile_fail,E0308
+    /// use std::sync::Arc;
+    /// let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+    ///     rustls::crypto::ring::default_provider(),
+    /// ))
+    /// .with_safe_default_protocol_versions()
+    /// .unwrap()
+    /// .with_root_certificates(rustls::RootCertStore::empty())
+    /// .with_no_client_auth();
+    /// let _ = proofmark::http::Client::new().with_tls(Arc::new(config));
+    /// ```
     #[must_use]
-    pub fn with_tls(mut self, config: Arc<rustls::ClientConfig>) -> Self {
+    pub fn with_tls(mut self, config: TlsConfig) -> Self {
         self.tls = Some(config);
         self
     }
@@ -684,7 +703,7 @@ impl Client {
                 let config = self.tls.as_ref().ok_or(HttpError::TlsNotConfigured)?;
                 let name = ServerName::try_from(endpoint.host.clone())
                     .map_err(|e| HttpError::InvalidEndpoint(e.to_string()))?;
-                let session = rustls::ClientConnection::new(Arc::clone(config), name)
+                let session = rustls::ClientConnection::new(Arc::clone(&config.0), name)
                     .map_err(HttpError::Tls)?;
                 Conn::Tls(Box::new(rustls::StreamOwned::new(session, tcp)))
             }
