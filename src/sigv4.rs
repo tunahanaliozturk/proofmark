@@ -440,11 +440,19 @@ fn collapse_spaces(value: &str) -> String {
         .join(" ")
 }
 
-/// The canonical URI of a path as sent: decoded, then encoded once with `/`
-/// kept. S3 does not normalise, so `//` and `.` segments stay as they are.
+/// The canonical URI of a path as sent: each segment between literal `/`
+/// decoded, then encoded once, so an escaped `%2F` inside a segment stays
+/// escaped. S3 does not normalise, so `//` and `.` segments stay as they
+/// are. An empty path is `/`.
 #[must_use]
 pub fn canonical_uri(path: &str) -> String {
-    encode_path(&percent_decode(path))
+    if path.is_empty() {
+        return "/".to_owned();
+    }
+    path.split('/')
+        .map(|segment| encode_component(&percent_decode(segment)))
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn is_unreserved(byte: u8) -> bool {
@@ -626,6 +634,20 @@ mod tests {
         assert_eq!(canonical_uri("//example//"), "//example//");
         assert_eq!(canonical_uri("/a/./b/../c"), "/a/./b/../c");
         assert_eq!(canonical_uri("/test$file.text"), "/test%24file.text");
+    }
+
+    #[test]
+    fn the_canonical_uri_keeps_an_escaped_slash_escaped() {
+        // `a%2Fb` is one key segment holding a slash; decoding it to `a/b`
+        // would sign a different path from the one sent.
+        assert_eq!(canonical_uri("/bucket/a%2Fb"), "/bucket/a%2Fb");
+        assert_eq!(canonical_uri("/bucket/a%2fb"), "/bucket/a%2Fb");
+        assert_eq!(canonical_uri("/bucket/a%20b/c"), "/bucket/a%20b/c");
+    }
+
+    #[test]
+    fn an_empty_path_canonicalises_to_a_slash() {
+        assert_eq!(canonical_uri(""), "/");
     }
 
     #[test]
