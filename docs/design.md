@@ -271,7 +271,7 @@ A profile is a named list of probe ids plus the evidence for why that client nee
 
 ## Architecture
 
-One binary crate. No async runtime ([ADR 0002](adr/0002-own-http1-client-on-blocking-sockets.md)).
+One binary crate, with a library target that tests and the fuzz harness use and that is not an API ([ADR 0006](adr/0006-library-target-for-tests-not-an-api.md)). No async runtime ([ADR 0002](adr/0002-own-http1-client-on-blocking-sockets.md)).
 
 ```
 cli ──> config ──> preflight ──> plan ──> runner ──> report ──> exit code
@@ -290,7 +290,10 @@ cli ──> config ──> preflight ──> plan ──> runner ──> report 
 | `cli` | Parses arguments with lexopt into a `Command`. Help text is written by hand. | Pure |
 | `config` | Validates options into an immutable `RunConfig`: endpoint, region, selection, limits. | Pure |
 | `sigv4` | Canonical request, string to sign, signing key, `Authorization` header, presigned query, chunk and trailer signatures. Takes the time as an argument. | Pure |
-| `checksum` | CRC32, CRC32C, CRC64NVME, SHA-256, MD5, composite multipart values, base64, hex, the `aws-chunked` encoder and decoder. | Pure |
+| `checksum` | CRC32, CRC32C, CRC64NVME, SHA-256, MD5, composite multipart values, base64, hex. | Pure |
+| `aws_chunked` | The `aws-chunked` encoder and decoder, signed and unsigned, with trailers. | Pure |
+| `time` | UTC timestamps in the SigV4, HTTP-date and ISO 8601 forms. | Pure |
+| `rng` | The seeded SplitMix64 source for payloads and key names. | Pure |
 | `s3` | Request builders (`put_object(...) -> Request`) and response parsers (XML to structs, with roxmltree). Knows the S3 shapes, not the network. | Pure |
 | `http` | Writes a `Request` to a socket and reads a `Response`. TCP or TLS. Handles `100 Continue`, chunked bodies, `HEAD`, connection close, timeouts. | I/O |
 | `session` | Ties one run together: config, credentials, signer, the clock offset to the server, the ledger, the seeded random source, the run's buckets. Sends requests and records exchanges. | I/O |
@@ -404,7 +407,7 @@ All `cargo test` runs work offline. Network use is loopback to the fake only.
 
 - **Signer.** The SigV4 cases from the [aws-c-auth signing test suite](https://github.com/awslabs/aws-c-auth/tree/main/tests/aws-signing-test-suite) (Apache-2.0, `v4` directory) that apply to S3, and the worked examples in the [S3 SigV4 documentation](https://docs.aws.amazon.com/AmazonS3/latest/developerguide/sig-v4-header-based-auth.html). A deliberately wrong signer (one that normalises `//` in the path, which S3 must not do) must fail those tests.
 - **Checksums.** Each CRC against the catalogue's check value for `"123456789"` (`CRC_32_ISO_HDLC` 0xcbf43926, `CRC_32_ISCSI` 0xe3069283, `CRC_64_NVME` from crc-catalog 2.5.0). The `aws-chunked` encoder against the documented frame format, and the decoder against the encoder over random sizes, including zero and exact multiples of the chunk size.
-- **Parsers.** S3 XML responses captured from the stores in the matrix, kept as fixtures. The HTTP response parser is fuzzed with arbitrary bytes; it must return an error, never panic or loop.
+- **Parsers.** S3 XML responses captured from the stores in the matrix, kept as fixtures. The HTTP response parser, and the request parser the fake uses, are fuzzed with random bytes and with mutations of valid messages, fed in reads of 1 to 64 bytes; they must return an error, never panic or loop. The fuzzer is a seeded test (`tests/fuzz_parsers.rs`), not cargo-fuzz, which needs a nightly compiler and does not run on every platform here. `cargo test` runs it for a few seconds; `PROOFMARK_FUZZ_SECONDS=600` runs it for the ten minutes of the M1 exit test.
 - **Mutation test** ([ADR 0005](adr/0005-in-process-fake-as-the-test-bed.md)). Every probe passes against the correct fake and does not pass against each fault it declares, with the status it should report (`violation` and `silent` for ignored preconditions, `unsupported` for a 501). Every fault is caught by at least one probe; every probe declares at least one fault.
 - **Judges.** Each `judge` has unit tests on hand-built observations, including the edge cases: a race with zero contended rounds, a 409 from a loser, a missing `ETag`.
 - **Safety.** A bucket with one object in it makes `run --use-existing-bucket` exit 3 and write nothing. A foreign object written into the bucket during the run survives cleanup. A run killed part way (the test aborts the session after N requests) leaves a ledger, and `cleanup` removes exactly the ledger entries and nothing else. A cleanup that hits an undeletable object exits 5 and keeps the ledger.
@@ -417,7 +420,7 @@ All `cargo test` runs work offline. Network use is loopback to the fake only.
 
 - The binary: Windows (x86_64, MSVC), Linux (x86_64, aarch64) and macOS (aarch64). CI runs the full test suite on `windows-latest`, `ubuntu-latest` and `macos-latest`, so every probe is mutation-tested on every platform against the fake.
 - The store matrix runs on Linux only, because it needs Docker. Running a store locally on Windows needs Docker Desktop; that is optional and documented, not required for development.
-- Minimum Rust version 1.88, set by sha2 0.11.1. The CI `msrv` job checks it.
+- Minimum Rust version 1.88, set by let chains and `slice::as_chunks`. The CI `msrv` job checks it.
 - `ring` needs a C compiler at build time. That is present on the CI runners and on any machine with the Rust MSVC toolchain; release binaries need no compiler.
 
 ## Security considerations
@@ -438,17 +441,13 @@ Planned, with the newest stable version and licence as checked on crates.io on 2
 | --- | --- | --- | --- |
 | `httparse` | 1.10.1 | MIT OR Apache-2.0 | Parse HTTP/1.x request and response heads and chunk sizes, for the client and the fake. |
 | `rustls` | 0.23.46 | Apache-2.0 OR ISC OR MIT | TLS. Built with the `ring` provider, not the default `aws-lc-rs`, to keep the Windows build free of CMake and NASM. |
-| `ring` | 0.17.14 | Apache-2.0 AND ISC | Crypto provider for rustls. |
+| `ring` | 0.17.14 | Apache-2.0 AND ISC | Crypto provider for rustls, and SHA-256 and HMAC-SHA256 for SigV4 ([ADR 0007](adr/0007-ring-for-crypto-own-code-for-checksums.md)). |
 | `rustls-native-certs` | 0.8.5 | Apache-2.0 OR ISC OR MIT | Use the operating system's trust store. `webpki-roots` is not used: its licence, CDLA-Permissive-2.0, is not on the allow list. |
-| `sha2` | 0.11.1 | MIT OR Apache-2.0 | SHA-256 for SigV4 and the SHA-256 checksum. Needs Rust 1.88. |
-| `hmac` | 0.13.0 | MIT OR Apache-2.0 | HMAC-SHA256 for SigV4. |
-| `md-5` | 0.11.0 | MIT OR Apache-2.0 | `Content-MD5` and ETags. |
-| `crc` | 3.4.0 | MIT OR Apache-2.0 | CRC32, CRC32C and CRC64NVME. It depends on `crc-catalog` 2.5.0 (MIT OR Apache-2.0), which defines `CRC_32_ISO_HDLC`, `CRC_32_ISCSI` and `CRC_64_NVME` (checked in its source). One crate for all three; probe payloads are small, so a table-driven CRC is fast enough. |
 | `roxmltree` | 0.21.2 | MIT OR Apache-2.0 | Read S3 XML responses, and request bodies in the fake. Read-only, no dependencies. |
 | `serde`, `serde_json` | 1.0.229, 1.0.154 | MIT OR Apache-2.0 | Write and read the JSON report and the ledger. |
 | `lexopt` | 0.3.2 | MIT | Argument parsing with no dependencies. |
 
-Deliberately not used: the AWS SDK ([ADR 0001](adr/0001-raw-http-and-own-signer.md)); tokio, hyper and ureq ([ADR 0002](adr/0002-own-http1-client-on-blocking-sockets.md)); clap (large for six subcommands; the help text is written by hand); crates for base64, hex, timestamps, randomness, JUnit XML and terminal colour, each of which is a few dozen lines with tests here. The random source is a seeded SplitMix64: it only needs to make payloads and key names reproducible, not secret.
+Deliberately not used: the AWS SDK ([ADR 0001](adr/0001-raw-http-and-own-signer.md)); tokio, hyper and ureq ([ADR 0002](adr/0002-own-http1-client-on-blocking-sockets.md)); clap (large for six subcommands; the help text is written by hand); crates for base64, hex, timestamps, randomness, JUnit XML and terminal colour, each of which is a few dozen lines with tests here; `sha2`, `hmac`, `md-5` and `crc`, which were planned until M1 showed that `ring` covers SHA-256 and HMAC and that MD5 and the CRCs are small enough to own against published vectors ([ADR 0007](adr/0007-ring-for-crypto-own-code-for-checksums.md)). The random source is a seeded SplitMix64: it only needs to make payloads and key names reproducible, not secret.
 
 ## Open questions
 
@@ -460,6 +459,6 @@ Deliberately not used: the AWS SDK ([ADR 0001](adr/0001-raw-http-and-own-signer.
 - **`If-Match` on a missing key.** The AWS page says a write with `If-Match` evaluates against existing objects; the exact status for a missing key (404 is expected) was not confirmed in the text read on 2026-11-22. To be pinned when `cond.put-if-match-missing` is written, or the probe only checks that nothing was created.
 - **Short retention.** No minimum retention is documented for a per-object `RetainUntilDate`. Whether stores accept 10 seconds is unknown; if many refuse, the default goes up and the probe takes longer.
 - **ureq's `Host` handling.** If ureq lets a caller send any `Host` header and leaves every other header alone, it could replace the own client ([ADR 0002](adr/0002-own-http1-client-on-blocking-sockets.md)). Not checked, and not needed for the plan.
-- **`ring`'s maintenance.** The latest `ring` release is 0.17.14 from 2025-03-11. If it falls behind, the alternative is rustls's default `aws-lc-rs` provider, at the cost of a heavier Windows build. To be revisited at M1.
+- **`ring`'s maintenance.** Settled at M1 (2026-11-25): `ring` stays, for the reasons in [ADR 0007](adr/0007-ring-for-crypto-own-code-for-checksums.md). The latest release is still 0.17.14 from 2025-03-11; RustSec lists no open advisory against it. Revisit if that changes or rustls drops the provider.
 - **Signed streaming in practice.** Which current clients still send `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` (signed chunks, without a trailer) was not checked. If none does, `sum.signed-streaming` moves out of the default selection.
 - **What the matrix may claim.** The published matrix says what one version of each store did with its default configuration plus the documented set-up. Vendors may object to a result. The process is the same as for expectations: evidence in a pull request.

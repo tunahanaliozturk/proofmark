@@ -6,4 +6,7 @@ A change to what a probe expects is listed under its own heading, **Expectation 
 
 ## Unreleased
 
-- Repository scaffold, design document, roadmap and decision records. No functional code yet.
+### Added
+
+- The wire and signing layer (M1): an HTTP/1.1 client with TLS, a SigV4 signer for headers, presigned URLs and signed chunks, the `aws-chunked` encoder and decoder, CRC32, CRC32C, CRC64NVME, MD5 and SHA-256, and the fake S3 server's skeleton. No commands use them yet.
+- Repository scaffold, design document, roadmap and decision records.

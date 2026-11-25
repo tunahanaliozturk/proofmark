@@ -6,7 +6,15 @@ A proof mark is the stamp a proof house strikes on a gun barrel after it has sur
 
 ## Status
 
-Planning. Nothing is built yet: the binary prints its name and version and exits. The repository holds the plan.
+Milestone M1 of the roadmap, the wire and signing layer, is built. There are no commands yet: the binary still prints its name and version and exits. What M1 added, and the test behind each claim:
+
+- A SigV4 signer for headers, presigned URLs and `aws-chunked` chunk and trailer signatures. It passes the 32 cases of the aws-c-auth signing suite that apply to S3 and the worked examples in the S3 guide (`tests/sigv4_vectors.rs`).
+- An HTTP/1.1 client on blocking sockets, with TLS, `100 Continue`, chunked responses and a timeout per exchange. It sends headers exactly as built (`src/http.rs` unit tests, `tests/fake_round_trip.rs`).
+- CRC32, CRC32C, CRC64NVME, MD5 and SHA-256, each pinned to published check values (`src/checksum.rs` unit tests).
+- An in-process fake S3 server: path-style bucket and object `PUT`, `GET`, `HEAD` and `DELETE`, with signature checks, over HTTP or TLS. A signed upload and download round-trip through it, and a wrong secret gets `403` (`tests/fake_round_trip.rs`).
+- The HTTP response parser ran for ten minutes under a fuzzer, 365 million inputs, with no panic and no hang (`tests/fuzz_parsers.rs`).
+
+The plan:
 
 - [docs/design.md](docs/design.md): what it will do, what it will not do, and how each claim will be tested.
 - [docs/roadmap.md](docs/roadmap.md): milestones to the first release, each with an exit test.
