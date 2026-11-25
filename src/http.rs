@@ -75,6 +75,11 @@ impl Request {
         self.query.push((key.to_owned(), value.to_owned()));
     }
 
+    /// Keeps only the query parameters for which `keep` is true.
+    pub(crate) fn retain_query(&mut self, keep: impl FnMut(&(String, String)) -> bool) {
+        self.query.retain(keep);
+    }
+
     /// Appends a header.
     pub fn push_header(&mut self, name: &str, value: &str) {
         self.headers.push((name.to_owned(), value.to_owned()));

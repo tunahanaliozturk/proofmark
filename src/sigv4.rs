@@ -49,6 +49,17 @@ const UNSIGNED_HEADERS: [&str; 10] = [
     "transfer-encoding",
 ];
 
+/// The query parameters a presigned request carries for authentication.
+const PRESIGN_PARAMETERS: [&str; 7] = [
+    "X-Amz-Algorithm",
+    "X-Amz-Credential",
+    "X-Amz-Date",
+    "X-Amz-Expires",
+    "X-Amz-SignedHeaders",
+    "X-Amz-Security-Token",
+    "X-Amz-Signature",
+];
+
 /// An access key pair, and a session token if the credentials are temporary.
 ///
 /// `Debug` prints the access key id only.
@@ -330,7 +341,16 @@ impl<'a> Signer<'a> {
     /// ([query string auth](https://docs.aws.amazon.com/AmazonS3/latest/developerguide/sigv4-query-string-auth.html)).
     /// Other services, which only the aws-c-auth vectors use, sign the
     /// SHA-256 of the body as those vectors expect.
+    ///
+    /// Authentication parameters already on the request, from an earlier
+    /// presign or put there by hand, are removed first and replaced, so
+    /// none is signed or sent twice. Names are compared ignoring case.
     pub fn presign(&self, request: &mut Request, expires_seconds: u32) -> Signature {
+        request.retain_query(|(key, _)| {
+            !PRESIGN_PARAMETERS
+                .iter()
+                .any(|name| key.eq_ignore_ascii_case(name))
+        });
         let payload_hash = if self.service == "s3" {
             UNSIGNED_PAYLOAD.to_owned()
         } else {
@@ -744,6 +764,28 @@ mod tests {
             "{}",
             signature.canonical_request()
         );
+    }
+
+    #[test]
+    fn presigning_again_replaces_the_old_authentication_parameters() {
+        let creds = Credentials::new("AKID", "secret").with_session_token("token");
+        let time = UtcTime::parse_amz("20130524T000000Z").expect("time");
+        let signer = Signer::new(&creds, "us-east-1", "s3", time);
+        let fresh = Request::new("GET", "/b/k")
+            .with_header("host", "h")
+            .with_query("versionId", "1");
+        let mut once = fresh.clone();
+        let first = signer.presign(&mut once, 60);
+
+        let mut twice = once.clone();
+        assert_eq!(signer.presign(&mut twice, 60), first);
+        assert_eq!(twice.target(), once.target());
+
+        let mut stale = fresh
+            .with_query("X-Amz-Signature", "0000")
+            .with_query("x-amz-credential", "old");
+        assert_eq!(signer.presign(&mut stale, 60), first);
+        assert_eq!(stale.target(), once.target());
     }
 
     #[test]
