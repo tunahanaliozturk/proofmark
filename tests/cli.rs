@@ -358,6 +358,41 @@ fn cleanup_refuses_a_ledger_written_for_another_endpoint() {
     assert!(dir.join("ledger.jsonl").exists());
 }
 
+/// Cleanup records each delete in the ledger it keeps. A key it removed
+/// that someone writes again before the next cleanup is someone else's now,
+/// and the next cleanup leaves it alone.
+#[test]
+fn a_second_cleanup_leaves_a_key_someone_wrote_after_the_first() {
+    let server = interfering(5, None);
+    let dir = temp_dir("replay");
+    let endpoint = server.endpoint().to_string();
+    let args = ["--endpoint", &endpoint, "--ledger", "ledger.jsonl"];
+    let output = run(proofmark(&dir).arg("run").args(args));
+    assert_exit(&output, 5);
+    let ledger = std::fs::read_to_string(dir.join("ledger.jsonl")).expect("ledger kept");
+    let put: serde_json::Value = ledger
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|v| v["op"] == "put_object" && v["status"] == 200)
+        .expect("a recorded write");
+    let (bucket, key) = (
+        put["bucket"].as_str().expect("bucket"),
+        put["key"].as_str().expect("key"),
+    );
+    assert!(
+        !server.snapshot()[bucket].contains_key(key),
+        "the run's cleanup removed {key}"
+    );
+    foreign_put(&server.endpoint(), bucket, Some(key));
+
+    let output = run(proofmark(&dir).arg("cleanup").args(args));
+    assert_exit(&output, 5);
+    assert!(
+        server.snapshot()[bucket].contains_key(key),
+        "the second cleanup deleted {key}, written by someone else after the first"
+    );
+}
+
 /// A ledger is trusted only where it names what proofmark itself writes:
 /// buckets `proofmark-<run id>-*`, and keys under `proofmark-<run id>/` in
 /// those or in the bucket given with `--bucket`. Anything else is refused

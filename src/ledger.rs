@@ -8,14 +8,20 @@
 //! {"proofmark_ledger":1,"run_id":"k3x9q2","endpoint":"http://127.0.0.1:9000","region":"us-east-1"}
 //! {"op":"create_bucket","bucket":"proofmark-k3x9q2-main"}
 //! {"op":"create_bucket","bucket":"proofmark-k3x9q2-main","status":200}
-//! {"op":"put_object","bucket":"proofmark-k3x9q2-main","key":"basic.put-get/object"}
-//! {"op":"put_object","bucket":"proofmark-k3x9q2-main","key":"basic.put-get/object","status":200,"version_id":null}
+//! {"op":"put_object","bucket":"proofmark-k3x9q2-main","key":"proofmark-k3x9q2/basic.put-get/object"}
+//! {"op":"put_object","bucket":"proofmark-k3x9q2-main","key":"proofmark-k3x9q2/basic.put-get/object","status":200,"version_id":null}
+//! {"op":"delete_object","bucket":"proofmark-k3x9q2-main","key":"proofmark-k3x9q2/basic.put-get/object","status":204,"version_id":null}
 //! ```
 //!
 //! An entry without `status` is an intent; one with it is the outcome.
 //! Each line is written with one call and flushed before the request goes
 //! out, so a crash leaves at worst a cut-off last line, which the reader
 //! skips: the request it was about to announce was never sent.
+//!
+//! Deletes are recorded only as outcomes, after the response: a delete
+//! that happened and was not recorded is sent again by the next cleanup,
+//! which is harmless, while a recorded delete stops a later cleanup from
+//! deleting a key that someone else has written since.
 //!
 //! The ledger holds bucket names, keys and version ids. Nothing secret.
 
@@ -47,15 +53,44 @@ pub enum Op {
     CreateBucket,
     /// `PutObject`.
     PutObject,
+    /// `DeleteObject`, of a key or of one version id of it.
+    DeleteObject,
+    /// `DeleteBucket`.
+    DeleteBucket,
 }
 
 impl Op {
+    const ALL: [Self; 4] = [
+        Self::CreateBucket,
+        Self::PutObject,
+        Self::DeleteObject,
+        Self::DeleteBucket,
+    ];
+
     fn as_str(self) -> &'static str {
         match self {
             Self::CreateBucket => "create_bucket",
             Self::PutObject => "put_object",
+            Self::DeleteObject => "delete_object",
+            Self::DeleteBucket => "delete_bucket",
         }
     }
+
+    fn has_key(self) -> bool {
+        matches!(self, Self::PutObject | Self::DeleteObject)
+    }
+}
+
+/// Whether a write answered with `status` was refused: it did not happen.
+/// A 5xx may have happened all the same, like a write with no answer.
+fn refused(status: u16) -> bool {
+    (300..500).contains(&status)
+}
+
+/// Whether a delete answered with `status` leaves the thing gone.
+#[must_use]
+pub fn gone(status: u16) -> bool {
+    (200..300).contains(&status) || status == 404
 }
 
 /// One line after the header.
@@ -69,7 +104,8 @@ pub struct Entry {
     pub key: Option<String>,
     /// `None` for an intent; the response status for an outcome.
     pub status: Option<u16>,
-    /// The version id the response gave, if any.
+    /// The version id the response gave, if any; for a delete, the version
+    /// id it deleted.
     pub version_id: Option<String>,
 }
 
@@ -95,6 +131,24 @@ impl Entry {
             key: Some(key.to_owned()),
             status: None,
             version_id: None,
+        }
+    }
+
+    /// A delete of `key` in `bucket`; recorded only with its outcome.
+    #[must_use]
+    pub fn delete_object(bucket: &str, key: &str) -> Self {
+        Self {
+            op: Op::DeleteObject,
+            ..Self::put_object(bucket, key)
+        }
+    }
+
+    /// A delete of `bucket`; recorded only with its outcome.
+    #[must_use]
+    pub fn delete_bucket(bucket: &str) -> Self {
+        Self {
+            op: Op::DeleteBucket,
+            ..Self::create_bucket(bucket)
         }
     }
 
@@ -124,13 +178,10 @@ impl Entry {
 
     fn from_json(value: &Value) -> Option<Self> {
         let text = |name: &str| value.get(name).and_then(Value::as_str).map(str::to_owned);
-        let op = match value.get("op")?.as_str()? {
-            "create_bucket" => Op::CreateBucket,
-            "put_object" => Op::PutObject,
-            _ => return None,
-        };
+        let name = value.get("op")?.as_str()?;
+        let op = Op::ALL.into_iter().find(|op| op.as_str() == name)?;
         let key = text("key");
-        if (op == Op::PutObject) != key.is_some() {
+        if op.has_key() != key.is_some() {
             return None;
         }
         let status = match value.get("status") {
@@ -175,6 +226,20 @@ impl Ledger {
         });
         ledger.write_line(&line)?;
         Ok(ledger)
+    }
+
+    /// Opens the existing ledger at `path` to append to it, as cleanup does
+    /// to record its deletes.
+    ///
+    /// # Errors
+    ///
+    /// The I/O error.
+    pub fn append(path: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new().append(true).open(path)?;
+        Ok(Self {
+            file,
+            path: path.to_owned(),
+        })
     }
 
     /// Appends `entry` and flushes it.
@@ -283,12 +348,14 @@ pub fn read(path: &Path) -> Result<(Header, Vec<Entry>), ReadError> {
 /// What cleanup must remove, worked out from a ledger's entries.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Plan {
-    /// Each object written: bucket, key, and the version ids its writes
-    /// returned. A plain delete is also needed when any write of the key
-    /// returned no version id, or its outcome was never recorded.
+    /// Each object written and not yet deleted: bucket, key, and the
+    /// version ids its writes returned. A plain delete is also needed when
+    /// any write of the key returned no version id, or its outcome was
+    /// never recorded. A key whose writes were all refused is not here.
     pub objects: Vec<PlannedObject>,
-    /// Buckets this run created, or may have created. A bucket whose
-    /// creation was answered with an error is not this run's and is left.
+    /// Buckets this run created, or may have created, and has not deleted.
+    /// A bucket whose creation was refused (3xx or 4xx) is not this run's
+    /// and is left.
     pub buckets: Vec<String>,
 }
 
@@ -305,70 +372,87 @@ pub struct PlannedObject {
     pub plain_delete: bool,
 }
 
-/// Works out the cleanup plan. Every intent counts, whether or not its
-/// outcome was recorded: a crash between request and response leaves an
-/// intent alone, and that write may well have happened.
+/// Works out the cleanup plan, reading the entries in order. Every intent
+/// counts, whether or not its outcome was recorded: a crash between
+/// request and response leaves an intent alone, and that write may well
+/// have happened. An outcome saying the store refused the write cancels
+/// its intent, and a recorded delete ends what was written before it.
 #[must_use]
 pub fn plan(entries: &[Entry]) -> Plan {
-    let mut plan = Plan::default();
+    // Each key, with the number of its writes that have no outcome yet.
+    let mut objects: Vec<(PlannedObject, usize)> = Vec::new();
+    let mut buckets: Vec<String> = Vec::new();
     for entry in entries {
-        match (entry.op, &entry.key) {
-            (Op::PutObject, Some(key)) => {
-                let index = plan
-                    .objects
+        match (entry.op, &entry.key, entry.status) {
+            (Op::PutObject | Op::DeleteObject, Some(key), status) => {
+                let index = objects
                     .iter()
-                    .position(|o| o.bucket == entry.bucket && &o.key == key)
+                    .position(|(o, _)| o.bucket == entry.bucket && &o.key == key)
                     .unwrap_or_else(|| {
-                        plan.objects.push(PlannedObject {
+                        let object = PlannedObject {
                             bucket: entry.bucket.clone(),
                             key: key.clone(),
                             version_ids: Vec::new(),
                             plain_delete: false,
-                        });
-                        plan.objects.len() - 1
+                        };
+                        objects.push((object, 0));
+                        objects.len() - 1
                     });
-                let object = &mut plan.objects[index];
-                if let (Some(_), Some(id)) = (entry.status, entry.version_id.as_deref())
-                    && id != "null"
-                    && !object.version_ids.iter().any(|v| v == id)
-                {
-                    object.version_ids.push(id.to_owned());
+                let (object, open) = &mut objects[index];
+                let version = entry.version_id.as_deref().filter(|v| *v != "null");
+                match (entry.op, status) {
+                    (Op::PutObject, None) => *open += 1,
+                    (Op::PutObject, Some(status)) => {
+                        *open = open.saturating_sub(1);
+                        match version {
+                            _ if refused(status) => {}
+                            Some(id) => {
+                                if !object.version_ids.iter().any(|v| v == id) {
+                                    object.version_ids.push(id.to_owned());
+                                }
+                            }
+                            // Written to an unversioned bucket: only a plain
+                            // delete removes it.
+                            None => object.plain_delete = true,
+                        }
+                    }
+                    (_, Some(status)) if gone(status) => {
+                        if let Some(id) = version {
+                            object.version_ids.retain(|v| v != id);
+                        } else {
+                            object.plain_delete = false;
+                            *open = 0;
+                        }
+                    }
+                    _ => {}
                 }
             }
-            (Op::CreateBucket, _) => match entry.status {
-                None => {
-                    if !plan.buckets.contains(&entry.bucket) {
-                        plan.buckets.push(entry.bucket.clone());
-                    }
+            (Op::CreateBucket, _, None) => {
+                if !buckets.contains(&entry.bucket) {
+                    buckets.push(entry.bucket.clone());
                 }
-                Some(status) if !(200..300).contains(&status) => {
-                    plan.buckets.retain(|b| b != &entry.bucket);
-                }
-                Some(_) => {}
-            },
-            (Op::PutObject, None) => {}
+            }
+            (Op::CreateBucket, _, Some(status)) if refused(status) => {
+                buckets.retain(|b| b != &entry.bucket);
+            }
+            (Op::DeleteBucket, _, Some(status)) if gone(status) => {
+                buckets.retain(|b| b != &entry.bucket);
+            }
+            _ => {}
         }
     }
     // A key needs a plain delete unless every write of it is known to have
-    // returned a version id: an intent with no recorded outcome may have
-    // been written, and an outcome without a version id was written to an
-    // unversioned bucket. In a versioned bucket a plain delete would only
-    // add a delete marker, so it is not sent when it is not needed.
-    for object in &mut plan.objects {
-        let of_key = |e: &&Entry| e.bucket == object.bucket && e.key.as_ref() == Some(&object.key);
-        let intents = entries
-            .iter()
-            .filter(of_key)
-            .filter(|e| e.status.is_none())
-            .count();
-        let versioned = entries
-            .iter()
-            .filter(of_key)
-            .filter(|e| e.status.is_some() && e.version_id.as_deref().is_some_and(|v| v != "null"))
-            .count();
-        object.plain_delete = intents > versioned;
-    }
-    plan
+    // returned a version id: a write with no recorded outcome may have
+    // happened. In a versioned bucket a plain delete would only add a
+    // delete marker, so it is not sent when it is not needed.
+    let objects = objects
+        .into_iter()
+        .filter_map(|(mut object, open)| {
+            object.plain_delete |= open > 0;
+            (object.plain_delete || !object.version_ids.is_empty()).then_some(object)
+        })
+        .collect();
+    Plan { objects, buckets }
 }
 
 #[cfg(test)]
@@ -460,6 +544,41 @@ mod tests {
             .map(|o| (o.key.as_str(), o.plain_delete))
             .collect();
         assert_eq!(keys, vec![("k", true), ("lost-response", true)]);
+    }
+
+    /// A write the store refused (3xx, 4xx) did not happen and its key may
+    /// be someone else's; a 5xx may have happened after all. A recorded
+    /// delete ends the key's claim until it is written again.
+    #[test]
+    fn plans_only_what_may_have_been_written_and_not_yet_deleted() {
+        let refused = Entry::put_object("b", "refused");
+        let failed = Entry::put_object("b", "failed");
+        let deleted = Entry::put_object("b", "deleted");
+        let rewritten = Entry::put_object("b", "rewritten");
+        let crashed = Entry::create_bucket("crashed");
+        let gone = Entry::create_bucket("gone");
+        let entries = vec![
+            refused.clone(),
+            refused.outcome(400, None),
+            failed.clone(),
+            failed.outcome(500, None),
+            deleted.clone(),
+            deleted.outcome(200, None),
+            Entry::delete_object("b", "deleted").outcome(204, None),
+            rewritten.clone(),
+            rewritten.outcome(200, None),
+            Entry::delete_object("b", "rewritten").outcome(204, None),
+            rewritten.clone(),
+            crashed.clone(),
+            crashed.outcome(500, None),
+            gone.clone(),
+            gone.outcome(200, None),
+            Entry::delete_bucket("gone").outcome(204, None),
+        ];
+        let plan = plan(&entries);
+        let keys: Vec<&str> = plan.objects.iter().map(|o| o.key.as_str()).collect();
+        assert_eq!(keys, vec!["failed", "rewritten"]);
+        assert_eq!(plan.buckets, vec!["crashed".to_owned()]);
     }
 
     #[test]

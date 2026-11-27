@@ -5,7 +5,7 @@
 use std::path::Path;
 
 use crate::http::{Endpoint, HttpError};
-use crate::ledger::{self, Entry, Header, ReadError};
+use crate::ledger::{self, Entry, Header, Ledger, ReadError};
 use crate::rng::SplitMix64;
 use crate::s3;
 use crate::session::{Call, Remote};
@@ -234,19 +234,30 @@ pub fn cleanup(
     let (header, entries) = ledger::read(path)?;
     trust(&header, &entries, remote.endpoint(), bucket).map_err(ReadError::Refused)?;
     let plan = ledger::plan(&entries);
+    // Each delete is recorded as it succeeds, so that a later cleanup from
+    // a kept ledger does not delete a key someone has written since.
+    let mut ledger = Ledger::append(path).map_err(ReadError::Io)?;
     let mut done = Cleanup::default();
     for object in &plan.objects {
-        let mut deletes: Vec<Call> = object
+        let record = Entry::delete_object(&object.bucket, &object.key);
+        let unversioned = object.plain_delete.then_some(None);
+        let mut all = true;
+        for version in object
             .version_ids
             .iter()
-            .map(|id| Call::new("DELETE", &object.bucket, Some(&object.key)).query("versionId", id))
-            .collect();
-        if object.plain_delete {
-            deletes.push(Call::new("DELETE", &object.bucket, Some(&object.key)));
-        }
-        let mut all = true;
-        for call in &deletes {
-            if let Err(why) = gone(remote, call, &mut done.responses) {
+            .map(|id| Some(id.as_str()))
+            .chain(unversioned)
+        {
+            let mut call = Call::new("DELETE", &object.bucket, Some(&object.key));
+            if let Some(id) = version {
+                call = call.query("versionId", id);
+            }
+            let deleted = gone(remote, &call, &mut done.responses).and_then(|status| {
+                ledger
+                    .record(&record.outcome(status, version))
+                    .map_err(|e| format!("deleted, but the ledger could not record it: {e}"))
+            });
+            if let Err(why) = deleted {
                 all = false;
                 done.left
                     .push(remote.scrub(&format!("object {}/{}: {why}", object.bucket, object.key)));
@@ -257,17 +268,20 @@ pub fn cleanup(
         }
     }
     for bucket in &plan.buckets {
-        match gone(
-            remote,
-            &Call::new("DELETE", bucket, None),
-            &mut done.responses,
-        ) {
+        let call = Call::new("DELETE", bucket, None);
+        let deleted = gone(remote, &call, &mut done.responses).and_then(|status| {
+            ledger
+                .record(&Entry::delete_bucket(bucket).outcome(status, None))
+                .map_err(|e| format!("deleted, but the ledger could not record it: {e}"))
+        });
+        match deleted {
             Ok(()) => done.buckets_removed += 1,
             Err(why) => done
                 .left
                 .push(remote.scrub(&format!("bucket {bucket}: {why}"))),
         }
     }
+    drop(ledger);
     if done.complete() {
         // Everything is gone; a ledger that cannot be removed only names
         // things that no longer exist.
@@ -276,18 +290,14 @@ pub fn cleanup(
     Ok(done)
 }
 
-/// Sends a delete; `Ok` if the thing is gone afterwards (2xx, or 404).
-fn gone(remote: &mut Remote, call: &Call, responses: &mut usize) -> Result<(), String> {
+/// Sends a delete; the status if the thing is gone afterwards (2xx, or 404).
+fn gone(remote: &mut Remote, call: &Call, responses: &mut usize) -> Result<u16, String> {
     let sent = remote.send(call);
     if sent.is_ok() {
         *responses += 1;
     }
     match sent {
-        Ok((_, response))
-            if (200..300).contains(&response.status()) || response.status() == 404 =>
-        {
-            Ok(())
-        }
+        Ok((_, response)) if ledger::gone(response.status()) => Ok(response.status()),
         Ok((_, response)) => Err(format!(
             "{} {}",
             response.status(),

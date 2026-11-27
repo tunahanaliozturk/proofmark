@@ -444,6 +444,15 @@ impl Session {
                 .record(&intent.outcome(response.status(), version.as_deref()))
                 .map_err(ProbeError::Ledger)?;
         }
+        if call.method == "DELETE"
+            && let Some(key) = &call.key
+        {
+            // So that cleanup does not delete the key again, perhaps after
+            // someone else has written it.
+            self.ledger
+                .record(&Entry::delete_object(&call.bucket, key).outcome(response.status(), None))
+                .map_err(ProbeError::Ledger)?;
+        }
         self.exchanges.push(Exchange {
             label,
             request,
