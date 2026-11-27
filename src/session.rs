@@ -271,10 +271,16 @@ impl Remote {
         let time = UtcTime::from_unix(UtcTime::now().unix().saturating_add(self.clock_offset));
         let wrong;
         let credentials = if call.wrong_secret {
-            wrong = Credentials::new(
+            let key = Credentials::new(
                 self.credentials.access_key_id(),
                 &format!("{}-wrong", self.credentials.secret_access_key()),
             );
+            // Only the secret is wrong: the token stays, so that a store
+            // using temporary credentials judges the signature.
+            wrong = match self.credentials.session_token() {
+                Some(token) => key.with_session_token(token),
+                None => key,
+            };
             &wrong
         } else {
             &self.credentials
@@ -736,6 +742,24 @@ mod tests {
             session.send("delete", &delete).expect("delete").status(),
             204
         );
+    }
+
+    /// The wrong-secret request keeps the session token: without it a store
+    /// that uses temporary credentials may refuse the request for the
+    /// missing token before it ever looks at the signature.
+    #[test]
+    fn a_request_signed_with_the_wrong_secret_keeps_the_session_token() {
+        let server =
+            crate::fake::FakeServer::start(crate::fake::FakeConfig::new()).expect("fake starts");
+        let mut remote = Remote::new(
+            Client::new(),
+            server.endpoint(),
+            crate::fake::credentials().with_session_token("tok-123"),
+            crate::fake::DEFAULT_REGION,
+        );
+        let call = Call::new("PUT", "b", Some("k")).signed_with_wrong_secret();
+        let (request, _) = remote.send(&call).expect("answered");
+        assert_eq!(request.header("x-amz-security-token"), Some("tok-123"));
     }
 
     /// The scrub would hide a leak here too, so the name redaction of the
