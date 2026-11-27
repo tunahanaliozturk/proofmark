@@ -39,40 +39,66 @@ pub fn error_code(body: &[u8]) -> Option<String> {
     plain.then(|| code.to_owned())
 }
 
-/// Whether a `ListObjectsV2`, `ListObjectVersions` or
-/// `ListMultipartUploads` response lists nothing at all.
+fn parse<'a>(body: &'a [u8], what: &str) -> Result<roxmltree::Document<'a>, String> {
+    let text = std::str::from_utf8(body).map_err(|_| format!("the {what} is not UTF-8"))?;
+    roxmltree::Document::parse(text).map_err(|e| format!("the {what} is not XML: {e}"))
+}
+
+/// Whether a listing whose root element must be `root`, such as
+/// `ListVersionsResult` or `ListMultipartUploadsResult`, lists nothing at
+/// all. Only a whole listing of the right kind that says so counts: it
+/// must carry `IsTruncated` set to `false`, and name no entry.
 ///
 /// # Errors
 ///
-/// A description of what was wrong if the body is not an XML listing. The
+/// A description of what was wrong if the body is not such a listing. The
 /// caller must then treat the bucket as not shown to be empty.
-pub fn listing_is_empty(body: &[u8]) -> Result<bool, String> {
-    let text = std::str::from_utf8(body).map_err(|_| "the listing is not UTF-8".to_owned())?;
-    let doc =
-        roxmltree::Document::parse(text).map_err(|e| format!("the listing is not XML: {e}"))?;
-    let root = doc.root_element();
-    let known = [
-        "ListBucketResult",
-        "ListVersionsResult",
-        "ListMultipartUploadsResult",
-    ];
-    if !known.contains(&root.tag_name().name()) {
+pub fn listing_is_empty(body: &[u8], root: &str) -> Result<bool, String> {
+    let doc = parse(body, "listing")?;
+    let got = doc.root_element();
+    if got.tag_name().name() != root {
         return Err(format!(
-            "expected a listing, got <{}>",
-            root.tag_name().name()
+            "expected <{root}>, got <{}>",
+            got.tag_name().name()
         ));
     }
     let mut empty = true;
-    for child in root.children().filter(roxmltree::Node::is_element) {
+    let mut complete = None;
+    for child in got.children().filter(roxmltree::Node::is_element) {
         let text = child.text().unwrap_or_default().trim();
         match child.tag_name().name() {
             "Contents" | "Version" | "DeleteMarker" | "Upload" | "CommonPrefixes" => empty = false,
             "KeyCount" if text != "0" => empty = false,
-            "IsTruncated" if !text.eq_ignore_ascii_case("false") => empty = false,
+            "IsTruncated" => complete = Some(text.eq_ignore_ascii_case("false")),
             _ => {}
         }
     }
-    Ok(empty)
+    match complete {
+        None => Err("the listing has no IsTruncated, so it may not be whole".to_owned()),
+        Some(complete) => Ok(empty && complete),
+    }
+}
+
+/// The `Status` of a `GetBucketVersioning` response: `None` for a bucket
+/// whose versioning was never turned on, which has no `Status`.
+///
+/// # Errors
+///
+/// A description of what was wrong if the body is not a versioning
+/// configuration.
+pub fn versioning_status(body: &[u8]) -> Result<Option<String>, String> {
+    let doc = parse(body, "versioning configuration")?;
+    let root = doc.root_element();
+    if root.tag_name().name() != "VersioningConfiguration" {
+        return Err(format!(
+            "expected <VersioningConfiguration>, got <{}>",
+            root.tag_name().name()
+        ));
+    }
+    Ok(root
+        .children()
+        .find(|n| n.is_element() && n.tag_name().name() == "Status")
+        .map(|n| n.text().unwrap_or_default().trim().to_owned()))
 }
 
 /// Escapes the five XML special characters.
@@ -109,23 +135,38 @@ mod tests {
 
     #[test]
     fn an_empty_listing_is_empty_and_anything_listed_is_not() {
+        let (versions, uploads) = ("ListVersionsResult", "ListMultipartUploadsResult");
         let ns = "xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"";
         let empty = format!(
-            "<ListBucketResult {ns}><Name>b</Name><KeyCount>0</KeyCount><IsTruncated>false</IsTruncated></ListBucketResult>"
+            "<ListVersionsResult {ns}><Name>b</Name><IsTruncated>false</IsTruncated></ListVersionsResult>"
         );
-        assert_eq!(listing_is_empty(empty.as_bytes()), Ok(true));
+        assert_eq!(listing_is_empty(empty.as_bytes(), versions), Ok(true));
+        assert!(listing_is_empty(empty.as_bytes(), uploads).is_err());
         let one = format!(
             "<ListVersionsResult {ns}><IsTruncated>false</IsTruncated><DeleteMarker><Key>k</Key></DeleteMarker></ListVersionsResult>"
         );
-        assert_eq!(listing_is_empty(one.as_bytes()), Ok(false));
-        let truncated = "<ListBucketResult><IsTruncated>true</IsTruncated></ListBucketResult>";
-        assert_eq!(listing_is_empty(truncated.as_bytes()), Ok(false));
-        let counted = "<ListBucketResult><KeyCount>3</KeyCount></ListBucketResult>";
-        assert_eq!(listing_is_empty(counted.as_bytes()), Ok(false));
-        let upload = "<ListMultipartUploadsResult><Upload><Key>k</Key></Upload></ListMultipartUploadsResult>";
-        assert_eq!(listing_is_empty(upload.as_bytes()), Ok(false));
-        assert!(listing_is_empty(b"<Error><Code>AccessDenied</Code></Error>").is_err());
-        assert!(listing_is_empty(b"").is_err());
+        assert_eq!(listing_is_empty(one.as_bytes(), versions), Ok(false));
+        let truncated = "<ListVersionsResult><IsTruncated>true</IsTruncated></ListVersionsResult>";
+        assert_eq!(listing_is_empty(truncated.as_bytes(), versions), Ok(false));
+        let counted = "<ListVersionsResult><IsTruncated>false</IsTruncated><KeyCount>3</KeyCount></ListVersionsResult>";
+        assert_eq!(listing_is_empty(counted.as_bytes(), versions), Ok(false));
+        let upload = "<ListMultipartUploadsResult><IsTruncated>false</IsTruncated><Upload><Key>k</Key></Upload></ListMultipartUploadsResult>";
+        assert_eq!(listing_is_empty(upload.as_bytes(), uploads), Ok(false));
+        assert!(listing_is_empty(b"<ListVersionsResult/>", versions).is_err());
+        assert!(listing_is_empty(b"<Error><Code>AccessDenied</Code></Error>", versions).is_err());
+        assert!(listing_is_empty(b"", versions).is_err());
+    }
+
+    #[test]
+    fn reads_the_versioning_status() {
+        let never = "<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"/>";
+        assert_eq!(versioning_status(never.as_bytes()), Ok(None));
+        let on = "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
+        assert_eq!(
+            versioning_status(on.as_bytes()),
+            Ok(Some("Enabled".to_owned()))
+        );
+        assert!(versioning_status(b"<Error/>").is_err());
     }
 
     #[test]

@@ -271,9 +271,16 @@ fn choose_bucket(
                 Emptiness::Empty => {}
                 Emptiness::NotEmpty(why) | Emptiness::Unknown(why) => {
                     return Err(Refusal::safety(format!(
-                        "refusing to work in {name}: {why}. proofmark only uses an existing bucket that is empty"
+                        "refusing to work in {name}: {why}. proofmark only uses an existing bucket that it can show to be empty; without --use-existing-bucket it creates its own"
                     )));
                 }
+            }
+            if let Some(why) = safety::check_unversioned(remote, name)
+                .map_err(|e: HttpError| Refusal::start(e.to_string()))?
+            {
+                return Err(Refusal::safety(format!(
+                    "refusing to work in {name}: {why}. Without --use-existing-bucket proofmark creates its own"
+                )));
             }
             (name.clone(), safety::key_prefix(&config.run_id), false)
         }

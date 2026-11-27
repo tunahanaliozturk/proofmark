@@ -101,37 +101,62 @@ pub enum Emptiness {
     Unknown(String),
 }
 
-/// Lists the bucket's object versions (or its objects, if the store does
-/// not implement version listing) and its multipart uploads, and says
-/// whether all are empty. It reads only.
+/// Lists the bucket's object versions and its multipart uploads, and says
+/// whether both are empty. It reads only.
 ///
-/// A store that answers `501` to the upload listing cannot hold an upload
-/// proofmark could disturb, so that counts as no uploads.
+/// Only a whole listing of the right kind that names nothing counts as
+/// empty. Anything else, including a store that does not implement one of
+/// the listings (`501`), leaves the bucket not shown to be empty: the
+/// current objects say nothing of old versions and delete markers, and a
+/// store that cannot list uploads may still hold some.
 ///
 /// # Errors
 ///
 /// [`HttpError`] if a listing gets no response.
 pub fn check_empty(remote: &mut Remote, bucket: &str) -> Result<Emptiness, HttpError> {
-    let versions = Call::new("GET", bucket, None).query("versions", "");
-    let (_, response) = remote.send(&versions)?;
-    let (what, response) = if response.status() == 501 {
-        let objects = Call::new("GET", bucket, None).query("list-type", "2");
-        ("objects", remote.send(&objects)?.1)
-    } else {
-        ("object versions", response)
-    };
-    if let Some(found) = judge_listing(what, &response) {
-        return Ok(found);
+    for (query, root, what) in [
+        ("versions", "ListVersionsResult", "object versions"),
+        ("uploads", "ListMultipartUploadsResult", "multipart uploads"),
+    ] {
+        let (_, response) = remote.send(&Call::new("GET", bucket, None).query(query, ""))?;
+        if let Some(found) = judge_listing(what, root, &response) {
+            return Ok(found);
+        }
     }
-    let uploads = Call::new("GET", bucket, None).query("uploads", "");
-    let (_, response) = remote.send(&uploads)?;
-    if response.status() == 501 {
-        return Ok(Emptiness::Empty);
-    }
-    Ok(judge_listing("multipart uploads", &response).unwrap_or(Emptiness::Empty))
+    Ok(Emptiness::Empty)
 }
 
-fn judge_listing(what: &str, response: &crate::http::Response) -> Option<Emptiness> {
+/// Why `bucket` may have had versioning turned on, or `None` if
+/// `GetBucketVersioning` shows it never was. Plain deletes in a bucket that
+/// has had versioning on leave versions or delete markers behind, so such a
+/// bucket is refused like one that is not empty. It reads only.
+///
+/// # Errors
+///
+/// [`HttpError`] if the request gets no response.
+pub fn check_unversioned(remote: &mut Remote, bucket: &str) -> Result<Option<String>, HttpError> {
+    let (_, response) = remote.send(&Call::new("GET", bucket, None).query("versioning", ""))?;
+    if response.status() != 200 {
+        let code = s3::error_code(response.body()).unwrap_or_default();
+        return Ok(Some(
+            format!(
+                "reading its versioning answered {} {code}",
+                response.status()
+            )
+            .trim_end()
+            .to_owned(),
+        ));
+    }
+    Ok(match s3::versioning_status(response.body()) {
+        Ok(None) => None,
+        Ok(Some(status)) => Some(format!(
+            "its versioning is {status:?}; proofmark does not yet work in a bucket that has had versioning on"
+        )),
+        Err(why) => Some(format!("reading its versioning: {why}")),
+    })
+}
+
+fn judge_listing(what: &str, root: &str, response: &crate::http::Response) -> Option<Emptiness> {
     if response.status() != 200 {
         let code = s3::error_code(response.body()).unwrap_or_default();
         return Some(Emptiness::Unknown(
@@ -140,7 +165,7 @@ fn judge_listing(what: &str, response: &crate::http::Response) -> Option<Emptine
                 .to_owned(),
         ));
     }
-    match s3::listing_is_empty(response.body()) {
+    match s3::listing_is_empty(response.body(), root) {
         Ok(true) => None,
         Ok(false) => Some(Emptiness::NotEmpty(format!("the bucket has {what}"))),
         Err(why) => Some(Emptiness::Unknown(format!("listing {what}: {why}"))),
@@ -312,6 +337,179 @@ fn gone(remote: &mut Remote, call: &Call, responses: &mut usize) -> Result<u16, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http::Client;
+    use std::io::{Read, Write};
+
+    /// A server on loopback that answers every request with what `answer`
+    /// makes of its request line.
+    type Answer = fn(&str) -> String;
+
+    fn scripted(answer: Answer) -> Endpoint {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut seen = Vec::new();
+                let mut buf = [0_u8; 4096];
+                while let Ok(n @ 1..) = stream.read(&mut buf) {
+                    seen.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&seen).into_owned();
+                    let Some(end) = text.find("\r\n\r\n") else {
+                        continue;
+                    };
+                    let length = text[..end]
+                        .lines()
+                        .find_map(|l| {
+                            let l = l.to_ascii_lowercase();
+                            l.strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if seen.len() >= end + 4 + length {
+                        let line = text.lines().next().unwrap_or_default().to_owned();
+                        let _ = stream.write_all(answer(&line).as_bytes());
+                        break;
+                    }
+                }
+            }
+        });
+        Endpoint::parse(&format!("http://127.0.0.1:{port}")).expect("endpoint")
+    }
+
+    fn reply(status: u16, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    const VERSIONS: &str = "<ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>b</Name><IsTruncated>false</IsTruncated></ListVersionsResult>";
+    const UPLOADS: &str = "<ListMultipartUploadsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>b</Bucket><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>";
+    const OBJECTS: &str = "<ListBucketResult><Name>b</Name><KeyCount>0</KeyCount><IsTruncated>false</IsTruncated></ListBucketResult>";
+
+    fn emptiness(answer: fn(&str) -> String) -> Emptiness {
+        let mut remote = Remote::new(
+            Client::new(),
+            scripted(answer),
+            crate::fake::credentials(),
+            "us-east-1",
+        );
+        check_empty(&mut remote, "b").expect("answered")
+    }
+
+    /// ADR 0004 and the decision that anything the check cannot read as
+    /// empty is not empty: an unsupported listing, a listing that lacks
+    /// what a complete one has, and a listing of the wrong kind each
+    /// refuse the bucket.
+    #[test]
+    fn the_empty_check_counts_what_it_cannot_read_as_empty_as_not_empty() {
+        assert_eq!(
+            emptiness(|line| reply(
+                200,
+                if line.contains("versions") {
+                    VERSIONS
+                } else {
+                    UPLOADS
+                }
+            )),
+            Emptiness::Empty
+        );
+        let refused: [fn(&str) -> String; 5] = [
+            // No version listing: the current objects say nothing of old
+            // versions and delete markers.
+            |line| match line {
+                l if l.contains("versions") => {
+                    reply(501, "<Error><Code>NotImplemented</Code></Error>")
+                }
+                l if l.contains("list-type") => reply(200, OBJECTS),
+                _ => reply(501, "<Error><Code>NotImplemented</Code></Error>"),
+            },
+            // No upload listing: uploads may exist all the same.
+            |line| match line {
+                l if l.contains("versions") => reply(200, VERSIONS),
+                _ => reply(501, "<Error><Code>NotImplemented</Code></Error>"),
+            },
+            // A versions listing without IsTruncated is not a whole one.
+            |line| match line {
+                l if l.contains("versions") => reply(200, "<ListVersionsResult/>"),
+                _ => reply(200, UPLOADS),
+            },
+            // The same empty listing whatever was asked: one of the two
+            // answers is a listing of the wrong kind.
+            |_| reply(200, UPLOADS),
+            |_| reply(200, VERSIONS),
+        ];
+        for (i, answer) in refused.into_iter().enumerate() {
+            let found = emptiness(answer);
+            assert!(
+                matches!(found, Emptiness::NotEmpty(_) | Emptiness::Unknown(_)),
+                "case {i}: {found:?}"
+            );
+        }
+    }
+
+    /// A bucket that has had versioning on keeps the versions and delete
+    /// markers that plain deletes leave, so an existing bucket is used only
+    /// when `GetBucketVersioning` shows versioning was never turned on.
+    #[test]
+    fn an_existing_bucket_that_may_be_versioned_is_refused_before_any_write() {
+        let cases: [fn(&str) -> String; 3] = [
+            |_| {
+                reply(
+                    200,
+                    "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>",
+                )
+            },
+            |_| {
+                reply(
+                    200,
+                    "<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>",
+                )
+            },
+            |_| reply(501, "<Error><Code>NotImplemented</Code></Error>"),
+        ];
+        let dir = std::env::temp_dir().join(format!("proofmark-safety-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        for (i, versioning) in cases.into_iter().enumerate() {
+            static VERSIONING: std::sync::Mutex<Option<Answer>> = std::sync::Mutex::new(None);
+            *VERSIONING.lock().expect("lock") = Some(versioning);
+            let endpoint = scripted(|line| match line {
+                l if l.starts_with("PUT") || l.starts_with("DELETE") => {
+                    reply(500, "<Error><Code>NotExpected</Code></Error>")
+                }
+                l if l.contains("versioning") => VERSIONING.lock().expect("lock").expect("set")(l),
+                l if l.contains("versions") => reply(200, VERSIONS),
+                l if l.contains("uploads") => reply(200, UPLOADS),
+                _ => reply(200, ""),
+            });
+            let ledger = dir.join(format!("versioned-{i}.jsonl"));
+            let _ = std::fs::remove_file(&ledger);
+            let config = crate::run::RunConfig {
+                endpoint,
+                region: "us-east-1".to_owned(),
+                credentials: crate::fake::credentials(),
+                probes: crate::probe::all().iter().collect(),
+                selection: (Vec::new(), Vec::new()),
+                bucket: crate::run::BucketMode::Existing("b".to_owned()),
+                ledger: Some(ledger.clone()),
+                ca_pem: None,
+                timeout: std::time::Duration::from_secs(5),
+                seed: 1,
+                run_id: "abc123".to_owned(),
+                fail_on: Vec::new(),
+            };
+            let secrets = crate::session::Secrets::default();
+            match crate::run::execute(&config, None, &secrets) {
+                Ok(report) => panic!("case {i}: ran {} probes", report.results.len()),
+                Err(refusal) => assert_eq!(refusal.code, 3, "case {i}: {refusal}"),
+            }
+            assert!(
+                !ledger.exists(),
+                "case {i}: a ledger means a write could follow"
+            );
+        }
+    }
 
     #[test]
     fn run_ids_make_valid_bucket_names() {

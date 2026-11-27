@@ -865,6 +865,14 @@ fn route(request: &Request, data: Vec<u8>, shared: &Shared) -> Result<Response, 
                 .objects;
             Ok(list_versions(&bucket, objects))
         }
+        (None, ["versioning"]) if request.method() == "GET" => {
+            // The fake has no versioning yet: every bucket is one whose
+            // versioning was never turned on, which has no Status.
+            store.buckets.get(&bucket).ok_or_else(no_such_bucket)?;
+            Ok(xml_response(&format!(
+                "<VersioningConfiguration xmlns=\"{XMLNS}\"/>"
+            )))
+        }
         (None, ["uploads"]) if request.method() == "GET" => {
             store.buckets.get(&bucket).ok_or_else(no_such_bucket)?;
             Ok(xml_response(&format!(
