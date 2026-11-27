@@ -1,6 +1,6 @@
 # 0008: What cleanup infers from the ledger
 
-Status: accepted, 2026-11-25
+Status: accepted, 2026-11-25. Amended by [ADR 0011](0011-a-ledger-names-only-what-proofmark-writes.md) (which ledgers are trusted, recorded deletes, refused writes) and [ADR 0012](0012-an-existing-bucket-must-be-shown-empty-and-unversioned.md) (versioned buckets).
 
 ## Context
 

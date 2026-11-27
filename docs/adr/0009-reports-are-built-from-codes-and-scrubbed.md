@@ -1,6 +1,6 @@
 # 0009: Output is built from codes and counts, and scrubbed of every secret used
 
-Status: accepted, 2026-11-25
+Status: accepted, 2026-11-25. Amended by [ADR 0013](0013-output-is-scrubbed-at-the-last-step.md): scrubbing moved to the last step and covers the access key id and encoded forms.
 
 ## Context
 

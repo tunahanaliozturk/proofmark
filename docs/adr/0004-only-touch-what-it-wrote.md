@@ -1,6 +1,6 @@
 # 0004: proofmark only deletes what it wrote, and writes only where it may
 
-Status: accepted, 2026-11-22
+Status: accepted, 2026-11-22. Rule 2 amended by [ADR 0012](0012-an-existing-bucket-must-be-shown-empty-and-unversioned.md); how cleanup trusts and updates the ledger is in [ADR 0011](0011-a-ledger-names-only-what-proofmark-writes.md).
 
 ## Context
 

@@ -76,7 +76,7 @@ From the environment only: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and, if 
 proofmark run      --endpoint URL [options]      run probes against an endpoint
 proofmark list     [--profile P] [--feature F]   show the probes and their expectations, no network
 proofmark explain  PROBE                         one probe: requests, expectation, citation, faults it catches
-proofmark cleanup  --endpoint URL --ledger FILE  remove what an interrupted run left behind
+proofmark cleanup  --endpoint URL --ledger FILE [--bucket NAME]  remove what an interrupted run left behind
 proofmark fake     [--listen ADDR] [--fault F]   run the fake S3 server, for trying proofmark out and for capturing SDK requests
 proofmark report   --input FILE... [options]     render, merge or compare JSON reports
 ```
@@ -113,12 +113,12 @@ There is no option to skip TLS verification. A store with a self-signed certific
 | --- | --- |
 | 0 | Every selected probe ended with a status not listed in `--fail-on`, and cleanup finished. |
 | 1 | At least one probe ended with a status listed in `--fail-on`. |
-| 2 | Usage error: unknown option, missing credentials, unknown probe, profile or feature. |
-| 3 | Safety refusal: the bucket is not empty, a bucket name is taken, or `--bucket` was given without `--use-existing-bucket`. Nothing was written. |
+| 2 | Usage error: unknown option, a value given to a flag, missing credentials, unknown probe, profile or feature. Also a run whose output or a requested report file could not be written, unless it already failed for another reason. |
+| 3 | Safety refusal: the existing bucket cannot be shown to be empty and never versioned ([ADR 0012](adr/0012-an-existing-bucket-must-be-shown-empty-and-unversioned.md)), a bucket name is taken, or `--bucket` was given without `--use-existing-bucket`. Nothing was written. |
 | 4 | Could not start: endpoint unreachable, TLS failure, or the preflight request was rejected (bad credentials, wrong region, clock skew over 15 minutes). |
-| 5 | Cleanup incomplete: something proofmark wrote is still there. The ledger is kept and its path printed. This wins over 0 and 1, because the user has to act. |
+| 5 | Cleanup incomplete: something proofmark wrote is still there. The ledger is kept and its path printed. This wins over every other code once something may have been written, because the user has to act. |
 
-`cleanup` exits 0 when nothing the ledger names is left (the ledger file is then removed), 5 if anything is left, 2 for a ledger it cannot read or one written for another endpoint, and 4 if no delete got any response. How cleanup reads a ledger that a crash left untidy is in [ADR 0008](adr/0008-what-cleanup-infers-from-the-ledger.md). `report --baseline` exits 1 when the results differ from the baseline.
+`cleanup` exits 0 when nothing the ledger names is left (the ledger file is then removed), 5 if anything is left, 2 for a ledger it cannot read, one written for another endpoint, or one that names anything proofmark does not write, and 4 if no delete got any response. `--bucket NAME` names the existing bucket a run used; without it only proofmark's own buckets are accepted. How cleanup reads a ledger that a crash left untidy is in [ADR 0008](adr/0008-what-cleanup-infers-from-the-ledger.md), and which ledgers it trusts in [ADR 0011](adr/0011-a-ledger-names-only-what-proofmark-writes.md). `report --baseline` exits 1 when the results differ from the baseline.
 
 ### Statuses
 
@@ -425,7 +425,7 @@ All `cargo test` runs work offline. Network use is loopback to the fake only.
 
 ## Security considerations
 
-- Credentials come from the environment and are never printed, written to a report or the ledger, or included in an error message. `Authorization` headers, `X-Amz-Signature` and `X-Amz-Credential` query values, `X-Amz-Security-Token` and `x-amz-security-token` are redacted in `--verbose` output and in the exchanges recorded in reports. The `Debug` output of a request and of a signature already hides them (M1). On top of that, every string that leaves a run (report details, targets, request ids, leftovers, log lines) has every secret the run used replaced: the secret key, the session token, and the signature of every request sent ([ADR 0009](adr/0009-reports-are-built-from-codes-and-scrubbed.md)). A store can echo what it was sent, as AWS does in `SignatureDoesNotMatch`; reports are built from status codes, error codes and counts, never from response bodies. A test plants a session token and searches every output format, the verbose log and the ledger for it, for the secret key and for every signature the fake received.
+- Credentials come from the environment and are never printed, written to a report or the ledger, or included in an error message. `Authorization` headers, `X-Amz-Signature` and `X-Amz-Credential` query values, `X-Amz-Security-Token` and `x-amz-security-token` are redacted in `--verbose` output and in the exchanges recorded in reports. The `Debug` output of a request and of a signature already hides them (M1). On top of that, everything the command writes (stdout, stderr, the verbose log, report files) is scrubbed as the last step of every secret the run used: the access key id, the secret key, the session token and the signature of every request sent, each as is, percent-encoded and base64-encoded ([ADR 0009](adr/0009-reports-are-built-from-codes-and-scrubbed.md), [ADR 0013](adr/0013-output-is-scrubbed-at-the-last-step.md)). A store can echo what it was sent, as AWS does in `SignatureDoesNotMatch`; reports are built from status codes, error codes and counts, never from response bodies. A test plants a session token and searches every output format, the verbose log and the ledger for it, for the access key id, for the secret key and for every signature the fake received; another has a store echo the signature and the access key id into its error code.
 - TLS verification is always on, using the operating system's trust store (rustls-native-certs) plus `--ca-file`. There is no switch to turn it off. The HTTP client only takes a TLS configuration it built itself from those roots; a caller cannot hand it a rustls configuration with a verifier of its own. If a later milestone needs to probe a store whose self-signed certificate has no CA to pass with `--ca-file`, that will be a separate option with its own name, and every report from a run that used it will say so. It is not planned.
 - Reports contain the endpoint URL, bucket names and request ids. They contain no object data beyond sizes and checksums.
 - The data-safety rules are in [ADR 0004](adr/0004-only-touch-what-it-wrote.md). The ledger contains bucket names, keys and version ids, nothing secret.

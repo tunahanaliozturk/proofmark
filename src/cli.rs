@@ -4,7 +4,7 @@
 //! | --- | --- |
 //! | 0 | every probe ended with a status not in `--fail-on`, and cleanup finished |
 //! | 1 | a probe ended with a status in `--fail-on` |
-//! | 2 | usage error |
+//! | 2 | usage error, or output that could not be written |
 //! | 3 | safety refusal; nothing was written |
 //! | 4 | could not start |
 //! | 5 | cleanup left something; the ledger is kept |
@@ -57,8 +57,8 @@ run options:
 Credentials come from AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and, if set,
 AWS_SESSION_TOKEN. There is no option to skip TLS verification.
 
-Exit codes: 0 all good, 1 a probe failed, 2 usage, 3 safety refusal,
-4 could not start, 5 cleanup incomplete.
+Exit codes: 0 all good, 1 a probe failed, 2 usage or output not written,
+3 safety refusal, 4 could not start, 5 cleanup incomplete.
 ";
 
 /// A usage error: a message, and exit code 2.
