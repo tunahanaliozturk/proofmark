@@ -266,6 +266,7 @@ struct Shared {
     store: Mutex<Store>,
     stop: AtomicBool,
     requests: AtomicU64,
+    handled: AtomicU64,
 }
 
 /// A running fake server. Dropping it stops accepting connections.
@@ -314,6 +315,7 @@ impl FakeServer {
             store: Mutex::new(Store::default()),
             stop: AtomicBool::new(false),
             requests: AtomicU64::new(0),
+            handled: AtomicU64::new(0),
         });
         let for_thread = Arc::clone(&shared);
         let accept = thread::Builder::new()
@@ -343,6 +345,13 @@ impl FakeServer {
     #[must_use]
     pub fn region(&self) -> &str {
         &self.shared.config.region
+    }
+
+    /// How many requests the server has finished handling: their changes
+    /// to the store are made, though the response may still be on its way.
+    #[must_use]
+    pub fn handled(&self) -> u64 {
+        self.shared.handled.load(Ordering::SeqCst)
     }
 
     /// Every bucket, key and `ETag` the server holds now.
@@ -453,6 +462,7 @@ fn serve(tcp: TcpStream, shared: &Shared) {
     let number = shared.requests.fetch_add(1, Ordering::SeqCst) + 1;
     let request_id = format!("{number:016X}");
     let (response, head_only) = handle(&mut wire, shared, &request_id, number);
+    shared.handled.fetch_add(1, Ordering::SeqCst);
     let stream = wire.get_mut();
     // The client may already be gone; there is nobody to tell.
     let _ = write_response(stream, &response, head_only, &request_id);
