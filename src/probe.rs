@@ -322,6 +322,28 @@ mod tests {
     }
 
     #[test]
+    fn any_501_makes_a_probe_unsupported_whatever_its_judge_says() {
+        use crate::http::{Request, Response};
+        let probe = find("basic.put-get").expect("probe");
+        let refused = Exchange {
+            label: "put",
+            request: Request::new("PUT", "/b/k"),
+            response: Response::new(
+                501,
+                Vec::new(),
+                b"<Error><Code>NotImplemented</Code></Error>".to_vec(),
+            ),
+        };
+        assert_eq!(
+            judge(probe, &[refused]),
+            Judgement::Unsupported {
+                detail: "put answered 501 NotImplemented".to_owned()
+            }
+        );
+        assert!(matches!(judge(probe, &[]), Judgement::Inconclusive { .. }));
+    }
+
+    #[test]
     fn every_probe_is_cited_and_catches_a_fault() {
         let mut ids = std::collections::HashSet::new();
         for probe in all() {
