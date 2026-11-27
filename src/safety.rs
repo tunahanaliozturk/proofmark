@@ -224,7 +224,11 @@ fn trust(
         let (ok, what) = match &entry.key {
             None => (own(&entry.bucket), format!("bucket {}", entry.bucket)),
             Some(key) => (
+                // A `.` or `..` segment goes out as it is, and a server or a
+                // proxy in front of it may resolve it to a key outside the
+                // prefix, so a key with one is not proofmark's.
                 key.starts_with(&prefix)
+                    && !key.split('/').any(|segment| matches!(segment, "." | ".."))
                     && (own(&entry.bucket) || bucket == Some(entry.bucket.as_str())),
                 format!("{}/{key}", entry.bucket),
             ),
@@ -579,6 +583,33 @@ pub(crate) mod tests {
             &"a".repeat(64),
         ] {
             assert!(!is_valid_bucket_name(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_ledger_key_with_a_dot_segment_is_not_trusted() {
+        let endpoint = Endpoint::parse("http://127.0.0.1:9000").expect("endpoint");
+        let header = Header {
+            run_id: "abc123".to_owned(),
+            endpoint: "http://127.0.0.1:9000".to_owned(),
+            region: "us-east-1".to_owned(),
+        };
+        let entry = |key: &str| Entry {
+            op: ledger::Op::PutObject,
+            bucket: "proofmark-abc123-main".to_owned(),
+            key: Some(key.to_owned()),
+            status: None,
+            version_id: None,
+        };
+        let own = [entry("proofmark-abc123/basic.put-get/object.v1..bak")];
+        assert_eq!(trust(&header, &own, &endpoint, None), Ok(()));
+        for key in [
+            "proofmark-abc123/../../other-bucket/key",
+            "proofmark-abc123/./../key",
+            "proofmark-abc123/a/..",
+        ] {
+            let refused = trust(&header, &[entry(key)], &endpoint, None);
+            assert!(refused.is_err(), "{key}");
         }
     }
 }
