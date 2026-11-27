@@ -414,3 +414,74 @@ impl Session {
         Ok(&self.exchanges[self.exchanges.len() - 1].response)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scrub_replaces_the_secret_key_and_the_session_token_anywhere() {
+        let credentials = Credentials::new("AKID", "s3cr3t/key").with_session_token("tok-123");
+        let remote = Remote::new(
+            Client::new(),
+            Endpoint::parse("http://127.0.0.1:9").expect("endpoint"),
+            credentials,
+            "us-east-1",
+        );
+        assert_eq!(
+            remote.scrub(
+                "<CanonicalRequest>x-amz-security-token:tok-123</CanonicalRequest> s3cr3t/key AKID"
+            ),
+            "<CanonicalRequest>x-amz-security-token:<redacted></CanonicalRequest> <redacted> AKID"
+        );
+        assert!(!format!("{remote:?}").contains("s3cr3t"));
+        assert!(!format!("{remote:?}").contains("tok-123"));
+    }
+
+    /// The scrub would hide a leak here too, so the name redaction of the
+    /// verbose log is checked on its own, with values the scrub does not know.
+    #[test]
+    fn the_log_redacts_secret_headers_by_name() {
+        #[derive(Clone, Default)]
+        struct Shared(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for Shared {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let log = Shared::default();
+        let mut remote = Remote::new(
+            Client::new(),
+            Endpoint::parse("http://127.0.0.1:9").expect("endpoint"),
+            Credentials::new("AKID", "secret"),
+            "us-east-1",
+        )
+        .with_log(Box::new(log.clone()));
+        remote.log_headers(
+            ">",
+            &[
+                (
+                    "Authorization".to_owned(),
+                    "Signature=unknown-sig".to_owned(),
+                ),
+                (
+                    "x-amz-security-token".to_owned(),
+                    "unknown-token".to_owned(),
+                ),
+                ("content-length".to_owned(), "5".to_owned()),
+            ],
+        );
+        let written = String::from_utf8_lossy(&log.0.lock().expect("log")).into_owned();
+        assert_eq!(
+            written,
+            "> Authorization: <redacted>\n> x-amz-security-token: <redacted>\n> content-length: 5\n"
+        );
+    }
+}
