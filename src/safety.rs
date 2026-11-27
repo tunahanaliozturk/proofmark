@@ -335,16 +335,16 @@ fn gone(remote: &mut Remote, call: &Call, responses: &mut usize) -> Result<u16, 
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::http::Client;
     use std::io::{Read, Write};
 
     /// A server on loopback that answers every request with what `answer`
     /// makes of its request line.
-    type Answer = fn(&str) -> String;
+    pub(crate) type Answer = fn(&str) -> String;
 
-    fn scripted(answer: Answer) -> Endpoint {
+    pub(crate) fn scripted(answer: Answer) -> Endpoint {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
         std::thread::spawn(move || {
@@ -377,7 +377,7 @@ mod tests {
         Endpoint::parse(&format!("http://127.0.0.1:{port}")).expect("endpoint")
     }
 
-    fn reply(status: u16, body: &str) -> String {
+    pub(crate) fn reply(status: u16, body: &str) -> String {
         format!(
             "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
             body.len()

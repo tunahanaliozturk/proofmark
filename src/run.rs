@@ -224,9 +224,9 @@ fn run_probes(session: &mut Session, probes: &[&'static Probe]) -> Vec<ProbeResu
                 if matches!(e, ProbeError::Ledger(_)) {
                     stopped = Some(e.to_string());
                 }
-                Judgement::Inconclusive {
+                probe::refused(&exchanges).unwrap_or(Judgement::Inconclusive {
                     reason: e.to_string(),
-                }
+                })
             }
         };
         results.push(result_of(probe, &judgement, &exchanges, session.remote()));
@@ -446,6 +446,44 @@ pub fn cleanup_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A probe that got a 501 is unsupported, even when a later request of
+    /// the same probe got no response at all.
+    #[test]
+    fn a_501_before_a_lost_response_still_makes_the_probe_unsupported() {
+        use crate::safety::tests::{reply, scripted};
+        let endpoint = scripted(|line| match line {
+            l if l.starts_with("HEAD") => reply(404, ""),
+            l if l.starts_with("PUT /proofmark-abc123-main/") => {
+                reply(501, "<Error><Code>NotImplemented</Code></Error>")
+            }
+            l if l.starts_with("PUT") || l.starts_with("DELETE") => reply(200, ""),
+            // The GET of the object: the connection closes with no answer.
+            l if l.starts_with("GET /proofmark-abc123-main/") => String::new(),
+            _ => reply(200, "<ListAllMyBucketsResult/>"),
+        });
+        let dir = std::env::temp_dir().join(format!("proofmark-run-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let ledger = dir.join("lost-after-501.jsonl");
+        let _ = std::fs::remove_file(&ledger);
+        let config = RunConfig {
+            endpoint,
+            region: "us-east-1".to_owned(),
+            credentials: crate::fake::credentials(),
+            probes: vec![probe::find("basic.put-get").expect("probe")],
+            selection: (Vec::new(), Vec::new()),
+            bucket: BucketMode::Own,
+            ledger: Some(ledger),
+            ca_pem: None,
+            timeout: Duration::from_secs(5),
+            seed: 1,
+            run_id: "abc123".to_owned(),
+            fail_on: Vec::new(),
+        };
+        let report = execute(&config, None, &Secrets::default()).expect("ran");
+        let result = &report.results[0];
+        assert_eq!(result.status, Status::Unsupported, "{}", result.detail);
+    }
 
     #[test]
     fn parses_the_http_date_the_fake_and_s3_send() {

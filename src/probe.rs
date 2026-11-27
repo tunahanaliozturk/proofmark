@@ -209,22 +209,27 @@ pub fn features() -> Vec<&'static str> {
     features
 }
 
+/// `unsupported` if any of `exchanges` got a `501`: the store refused
+/// honestly. This holds whatever happened after, a lost response included.
+#[must_use]
+pub fn refused(exchanges: &[Exchange]) -> Option<Judgement> {
+    let refused = exchanges.iter().find(|e| e.response.status() == 501)?;
+    Some(Judgement::Unsupported {
+        detail: format!(
+            "{} answered 501 {}",
+            refused.label,
+            s3::error_code(refused.response.body()).unwrap_or_default()
+        )
+        .trim_end()
+        .to_owned(),
+    })
+}
+
 /// Judges what a probe saw. Any `501` makes it `unsupported` whatever the
 /// judge would say: the store refused honestly.
 #[must_use]
 pub fn judge(probe: &Probe, exchanges: &[Exchange]) -> Judgement {
-    if let Some(refused) = exchanges.iter().find(|e| e.response.status() == 501) {
-        return Judgement::Unsupported {
-            detail: format!(
-                "{} answered 501 {}",
-                refused.label,
-                s3::error_code(refused.response.body()).unwrap_or_default()
-            )
-            .trim_end()
-            .to_owned(),
-        };
-    }
-    (probe.judge)(exchanges)
+    refused(exchanges).unwrap_or_else(|| (probe.judge)(exchanges))
 }
 
 // Helpers for judges. Each returns `Err(judgement)` to stop at the first
