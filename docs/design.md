@@ -118,7 +118,7 @@ There is no option to skip TLS verification. A store with a self-signed certific
 | 4 | Could not start: endpoint unreachable, TLS failure, or the preflight request was rejected (bad credentials, wrong region, clock skew over 15 minutes). |
 | 5 | Cleanup incomplete: something proofmark wrote is still there. The ledger is kept and its path printed. This wins over 0 and 1, because the user has to act. |
 
-`cleanup` exits 0 when the ledger is empty afterwards, 5 if anything is left, 2 or 4 as above. `report --baseline` exits 1 when the results differ from the baseline.
+`cleanup` exits 0 when nothing the ledger names is left (the ledger file is then removed), 5 if anything is left, 2 for a ledger it cannot read or one written for another endpoint, and 4 if no delete got any response. How cleanup reads a ledger that a crash left untidy is in [ADR 0008](adr/0008-what-cleanup-infers-from-the-ledger.md). `report --baseline` exits 1 when the results differ from the baseline.
 
 ### Statuses
 
@@ -287,14 +287,14 @@ cli ──> config ──> preflight ──> plan ──> runner ──> report 
 
 | Module | Does | Pure or I/O |
 | --- | --- | --- |
-| `cli` | Parses arguments with lexopt into a `Command`. Help text is written by hand. | Pure |
-| `config` | Validates options into an immutable `RunConfig`: endpoint, region, selection, limits. | Pure |
+| `cli` | Parses arguments by hand ([ADR 0010](adr/0010-arguments-parsed-by-hand.md)) and validates them into an immutable `RunConfig`: endpoint, region, selection, limits. Help text is written by hand. | Pure, plus reading the environment |
+| `run` | One run: preflight, safety set-up, the probes, cleanup, the report. Also the `cleanup` command. | I/O |
 | `sigv4` | Canonical request, string to sign, signing key, `Authorization` header, presigned query, chunk and trailer signatures. Takes the time as an argument. | Pure |
 | `checksum` | CRC32, CRC32C, CRC64NVME, SHA-256, MD5, composite multipart values, base64, hex. | Pure |
 | `aws_chunked` | The `aws-chunked` encoder and decoder, signed and unsigned, with trailers. | Pure |
 | `time` | UTC timestamps in the SigV4, HTTP-date and ISO 8601 forms. | Pure |
 | `rng` | The seeded SplitMix64 source for payloads and key names. | Pure |
-| `s3` | Request builders (`put_object(...) -> Request`) and response parsers (XML to structs, with roxmltree). Knows the S3 shapes, not the network. | Pure |
+| `s3` | Paths, and response parsers (XML error codes and listings, with roxmltree). Knows the S3 shapes, not the network. Requests are built as a `session::Call`. | Pure |
 | `http` | Writes a `Request` to a socket and reads a `Response`. TCP or TLS. Handles `100 Continue`, chunked bodies, `HEAD`, connection close, timeouts. | I/O |
 | `session` | Ties one run together: config, credentials, signer, the clock offset to the server, the ledger, the seeded random source, the run's buckets. Sends requests and records exchanges. | I/O |
 | `ledger` | Appends write intents and results to the JSON-lines ledger and flushes; reads it back for cleanup. | I/O |
@@ -425,7 +425,7 @@ All `cargo test` runs work offline. Network use is loopback to the fake only.
 
 ## Security considerations
 
-- Credentials come from the environment and are never printed, written to a report or the ledger, or included in an error message. `Authorization` headers, `X-Amz-Signature` and `X-Amz-Credential` query values, `X-Amz-Security-Token` and `x-amz-security-token` are redacted in `--verbose` output and in the exchanges recorded in reports. The `Debug` output of a request and of a signature already hides them (M1). A test greps every output format for a planted secret.
+- Credentials come from the environment and are never printed, written to a report or the ledger, or included in an error message. `Authorization` headers, `X-Amz-Signature` and `X-Amz-Credential` query values, `X-Amz-Security-Token` and `x-amz-security-token` are redacted in `--verbose` output and in the exchanges recorded in reports. The `Debug` output of a request and of a signature already hides them (M1). On top of that, every string that leaves a run (report details, targets, request ids, leftovers, log lines) has every secret the run used replaced: the secret key, the session token, and the signature of every request sent ([ADR 0009](adr/0009-reports-are-built-from-codes-and-scrubbed.md)). A store can echo what it was sent, as AWS does in `SignatureDoesNotMatch`; reports are built from status codes, error codes and counts, never from response bodies. A test plants a session token and searches every output format, the verbose log and the ledger for it, for the secret key and for every signature the fake received.
 - TLS verification is always on, using the operating system's trust store (rustls-native-certs) plus `--ca-file`. There is no switch to turn it off. The HTTP client only takes a TLS configuration it built itself from those roots; a caller cannot hand it a rustls configuration with a verifier of its own. If a later milestone needs to probe a store whose self-signed certificate has no CA to pass with `--ca-file`, that will be a separate option with its own name, and every report from a run that used it will say so. It is not planned.
 - Reports contain the endpoint URL, bucket names and request ids. They contain no object data beyond sizes and checksums.
 - The data-safety rules are in [ADR 0004](adr/0004-only-touch-what-it-wrote.md). The ledger contains bucket names, keys and version ids, nothing secret.
@@ -443,11 +443,10 @@ Planned, with the newest stable version and licence as checked on crates.io on 2
 | `rustls` | 0.23.46 | Apache-2.0 OR ISC OR MIT | TLS. Built with the `ring` provider, not the default `aws-lc-rs`, to keep the Windows build free of CMake and NASM. |
 | `ring` | 0.17.14 | Apache-2.0 AND ISC | Crypto provider for rustls, and SHA-256 and HMAC-SHA256 for SigV4 ([ADR 0007](adr/0007-ring-for-crypto-own-code-for-checksums.md)). |
 | `rustls-native-certs` | 0.8.5 | Apache-2.0 OR ISC OR MIT | Use the operating system's trust store. `webpki-roots` is not used: its licence, CDLA-Permissive-2.0, is not on the allow list. |
-| `roxmltree` | 0.21.2 | MIT OR Apache-2.0 | Read S3 XML responses, and request bodies in the fake. Read-only, no dependencies. |
-| `serde`, `serde_json` | 1.0.229, 1.0.154 | MIT OR Apache-2.0 | Write and read the JSON report and the ledger. |
-| `lexopt` | 0.3.2 | MIT | Argument parsing with no dependencies. |
+| `roxmltree` | 0.21.2 | MIT OR Apache-2.0 | Read S3 XML responses, and request bodies in the fake. Read-only; its one dependency is `memchr` (Unlicense OR MIT). Added at M2. |
+| `serde_json` | 1.0.154 | MIT OR Apache-2.0 | Write and read the JSON report and the ledger. Used through `Value`, so `serde`'s derive macros are not built. Added at M2. |
 
-Deliberately not used: the AWS SDK ([ADR 0001](adr/0001-raw-http-and-own-signer.md)); tokio, hyper and ureq ([ADR 0002](adr/0002-own-http1-client-on-blocking-sockets.md)); clap (large for six subcommands; the help text is written by hand); crates for base64, hex, timestamps, randomness, JUnit XML and terminal colour, each of which is a few dozen lines with tests here; `sha2`, `hmac`, `md-5` and `crc`, which were planned until M1 showed that `ring` covers SHA-256 and HMAC and that MD5 and the CRCs are small enough to own against published vectors ([ADR 0007](adr/0007-ring-for-crypto-own-code-for-checksums.md)). The random source is a seeded SplitMix64: it only needs to make payloads and key names reproducible, not secret.
+Deliberately not used: the AWS SDK ([ADR 0001](adr/0001-raw-http-and-own-signer.md)); tokio, hyper and ureq ([ADR 0002](adr/0002-own-http1-client-on-blocking-sockets.md)); clap (large for six subcommands; the help text is written by hand); `lexopt`, planned for argument parsing until M2 showed six commands with a few options each need none ([ADR 0010](adr/0010-arguments-parsed-by-hand.md)); crates for base64, hex, timestamps, randomness, JUnit XML and terminal colour, each of which is a few dozen lines with tests here; `sha2`, `hmac`, `md-5` and `crc`, which were planned until M1 showed that `ring` covers SHA-256 and HMAC and that MD5 and the CRCs are small enough to own against published vectors ([ADR 0007](adr/0007-ring-for-crypto-own-code-for-checksums.md)). The random source is a seeded SplitMix64: it only needs to make payloads and key names reproducible, not secret.
 
 ## Open questions
 

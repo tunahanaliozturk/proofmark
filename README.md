@@ -6,13 +6,21 @@ A proof mark is the stamp a proof house strikes on a gun barrel after it has sur
 
 ## Status
 
-Milestone M1 of the roadmap, the wire and signing layer, is built. There are no commands yet: the binary still prints its name and version and exits. What M1 added, and the test behind each claim:
+Milestones M1 (wire and signing) and M2 (safety, runner and reports) of the roadmap are built. The 14 `basic` probes run; the other features come in later milestones. To try it with no store at all:
 
-- A SigV4 signer for headers, presigned URLs and `aws-chunked` chunk and trailer signatures. It passes the 32 cases of the aws-c-auth signing suite that apply to S3 and the worked examples in the S3 guide (`tests/sigv4_vectors.rs`).
-- An HTTP/1.1 client on blocking sockets, with TLS, `100 Continue`, chunked responses and one deadline per exchange, from the name lookup to the last byte, that a peer sending one byte at a time cannot stretch. It sends headers exactly as built (`src/http.rs` unit tests, `tests/fake_round_trip.rs`).
-- CRC32, CRC32C, CRC64NVME, MD5 and SHA-256, each pinned to published check values (`src/checksum.rs` unit tests).
-- An in-process fake S3 server: path-style bucket and object `PUT`, `GET`, `HEAD` and `DELETE`, with signature checks, over HTTP or TLS. A signed upload and download round-trip through it, and a wrong secret gets `403` (`tests/fake_round_trip.rs`).
-- The HTTP response parser ran for ten minutes under a fuzzer, 365 million inputs, with no panic and no hang, and for two more minutes after the parser fixes from review, 68 million inputs (`tests/fuzz_parsers.rs`).
+```
+proofmark fake                      # one terminal: prints a published test key pair
+# another terminal: set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY to that pair, then
+proofmark run --endpoint http://127.0.0.1:9000 --report json=out.json
+```
+
+What exists, and the test behind each claim:
+
+- `run`, `list`, `explain`, `cleanup` and `fake`, with one test per exit code through the real binary (`tests/cli.rs`, `exit_0_...` to `exit_5_...`).
+- The 14 `basic` probes: object `PUT`, `GET`, `HEAD`, `DELETE`, metadata, ranges, `Content-MD5`, signatures, `100 Continue` and the common error responses. Each passes against the in-process fake and reports each fault it exists to catch with the right status and silence (`tests/probes.rs`).
+- Data safety ([ADR 0004](docs/adr/0004-only-touch-what-it-wrote.md), [ADR 0008](docs/adr/0008-what-cleanup-infers-from-the-ledger.md)). A non-empty existing bucket makes `run` exit 3 having sent no write. An object another client writes into the bucket mid-run survives cleanup. A run killed as any one of its requests arrives, for every request in the run, leaves a ledger from which `cleanup` puts the store back exactly as it was (`tests/cli.rs`).
+- No secrets in output ([ADR 0009](docs/adr/0009-reports-are-built-from-codes-and-scrubbed.md)): a planted session token, the secret key and every signature sent appear in none of the terminal output, the verbose log, the three report files and the ledger (`a_planted_secret_appears_in_no_output`).
+- From M1: a SigV4 signer that passes the 32 applicable cases of the aws-c-auth suite and the S3 guide's worked examples (`tests/sigv4_vectors.rs`); an HTTP/1.1 client with TLS, `100 Continue` and one deadline per exchange (`src/http.rs`, `tests/fake_round_trip.rs`); CRC32, CRC32C, CRC64NVME, MD5 and SHA-256 pinned to published check values (`src/checksum.rs`); a response parser fuzzed for ten minutes with no panic and no hang (`tests/fuzz_parsers.rs`).
 
 The plan:
 
