@@ -175,12 +175,19 @@ fn run_head(session: &mut Session) -> Result<(), ProbeError> {
 
 fn judge_head(ex: &[Exchange]) -> Judgement {
     from_checks((|| {
-        status_is(exchange(ex, "put")?, 200)?;
+        let put = exchange(ex, "put")?;
+        status_is(put, 200)?;
         let head = exchange(ex, "head")?;
         status_is(head, 200)?;
         let length = sent(ex, "put")?.len().to_string();
         header_is(head, "content-length", &length, false)?;
-        header_is(head, "etag", &md5_etag(sent(ex, "put")?), false)
+        // The same ETag the write returned; whether it is an MD5 is
+        // basic.etag-is-md5's question.
+        let etag = put
+            .response
+            .header("etag")
+            .ok_or_else(|| deviates("put answered 200 with no ETag".to_owned(), false))?;
+        header_is(head, "etag", etag, false)
     })())
 }
 
@@ -483,7 +490,7 @@ pub(super) static PROBES: &[Probe] = &[
         id: "basic.head",
         feature: "basic",
         expectation: documented(
-            "HEAD answers 200 with the object's Content-Length and ETag and no body",
+            "HEAD answers 200 with the object's Content-Length, the ETag the PUT returned, and no body",
             HEAD_OBJECT,
             "Description",
         ),
