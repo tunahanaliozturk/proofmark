@@ -511,6 +511,42 @@ mod tests {
         }
     }
 
+    /// A creation answered with a 5xx may have made the bucket. When
+    /// cleanup then cannot remove it, the run exits 5 like any run that
+    /// leaves something behind, not 4.
+    #[test]
+    fn a_failed_creation_that_leaves_cleanup_work_exits_5() {
+        let endpoint = scripted(|line| match line {
+            l if l.starts_with("HEAD") => reply(404, ""),
+            l if l.starts_with("PUT") || l.starts_with("DELETE") => {
+                reply(500, "<Error><Code>InternalError</Code></Error>")
+            }
+            _ => reply(200, "<ListAllMyBucketsResult/>"),
+        });
+        let dir = std::env::temp_dir().join(format!("proofmark-safety-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let ledger = dir.join("create-500.jsonl");
+        let _ = std::fs::remove_file(&ledger);
+        let config = crate::run::RunConfig {
+            endpoint,
+            region: "us-east-1".to_owned(),
+            credentials: crate::fake::credentials(),
+            probes: crate::probe::all().iter().collect(),
+            selection: (Vec::new(), Vec::new()),
+            bucket: crate::run::BucketMode::Own,
+            ledger: Some(ledger.clone()),
+            ca_pem: None,
+            timeout: std::time::Duration::from_secs(5),
+            seed: 1,
+            run_id: "abc123".to_owned(),
+            fail_on: Vec::new(),
+        };
+        let secrets = crate::session::Secrets::default();
+        let refusal = crate::run::execute(&config, None, &secrets).expect_err("no bucket");
+        assert_eq!(refusal.code, 5, "{refusal}");
+        assert!(ledger.exists(), "the ledger is kept for proofmark cleanup");
+    }
+
     #[test]
     fn run_ids_make_valid_bucket_names() {
         let mut rng = SplitMix64::new(7);

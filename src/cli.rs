@@ -98,6 +98,17 @@ impl Args {
     }
 }
 
+/// A flag takes no value. `--use-existing-bucket=false` is refused rather
+/// than read as the flag.
+fn flag(name: &str, inline: Option<&String>) -> Result<bool, Usage> {
+    match inline {
+        None => Ok(true),
+        Some(value) => Err(usage(format!(
+            "--{name} takes no value; leave it out to turn it off (got --{name}={value})"
+        ))),
+    }
+}
+
 /// Runs the command line `args` (without the program name), writing normal
 /// output to `out` and errors to `err`, and returns the exit code.
 ///
@@ -139,9 +150,11 @@ pub fn main(args: Vec<OsString>, out: &mut dyn Write, err: &mut dyn Write) -> u8
             }
         }
     };
-    let _ = emit(out, &secrets, &held_out);
+    let wrote = emit(out, &secrets, &held_out).is_ok();
     let _ = emit(err, &secrets, &held_err);
-    code
+    // Output that could not be written means the command did not do what
+    // it was asked; it never exits 0.
+    if wrote || code != 0 { code } else { 2 }
 }
 
 /// Writes `held`, scrubbed of `secrets`, to `stream`.
@@ -200,13 +213,19 @@ fn read_ca(path: Option<String>) -> Result<Option<Vec<u8>>, Usage> {
         .transpose()
 }
 
+/// The longest `--timeout`: a day. Far longer than any request needs, and
+/// short enough that adding it to the clock cannot overflow.
+const MAX_TIMEOUT_SECONDS: u64 = 24 * 60 * 60;
+
 fn parse_timeout(value: Option<String>) -> Result<Duration, Usage> {
     match value {
         None => Ok(Duration::from_secs(30)),
         Some(text) => match text.parse::<u64>() {
-            Ok(seconds) if seconds > 0 => Ok(Duration::from_secs(seconds)),
+            Ok(seconds) if (1..=MAX_TIMEOUT_SECONDS).contains(&seconds) => {
+                Ok(Duration::from_secs(seconds))
+            }
             _ => Err(usage(format!(
-                "--timeout {text:?} is not a whole number of seconds above 0"
+                "--timeout {text:?} is not a whole number of seconds from 1 to {MAX_TIMEOUT_SECONDS}"
             ))),
         },
     }
@@ -271,8 +290,8 @@ fn parse_run(args: &mut Args) -> Result<Result<RunOptions, String>, Usage> {
             return Err(usage("run takes options only"));
         };
         match name.as_str() {
-            "use-existing-bucket" => existing = true,
-            "verbose" => verbose = true,
+            "use-existing-bucket" => existing = flag(&name, inline.as_ref())?,
+            "verbose" => verbose = flag(&name, inline.as_ref())?,
             "endpoint" => endpoint = Some(args.value(&name, inline)?),
             "region" => region = Some(args.value(&name, inline)?),
             "probe" => ids.push(args.value(&name, inline)?),
@@ -380,17 +399,32 @@ fn run_command(
         }
     };
     let _ = out.write_all(report.terminal().as_bytes());
+    let mut written = true;
     for (format, path) in &options.reports {
         let text = match format {
             Format::Json => report.json(),
             Format::Junit => report.junit(),
             Format::Markdown => report.markdown(),
         };
-        if let Err(e) = std::fs::write(path, secrets.scrub(&text)) {
+        // A kept ledger is what cleanup needs; a report path that names
+        // the same file, under any spelling, must not overwrite it.
+        let ledger = std::fs::canonicalize(&report.ledger);
+        if ledger.is_ok() && ledger.ok() == std::fs::canonicalize(path).ok() {
+            written = false;
+            let _ = writeln!(
+                err,
+                "proofmark: not writing the report to {}: it is the ledger, which cleanup still needs",
+                path.display()
+            );
+        } else if let Err(e) = std::fs::write(path, secrets.scrub(&text)) {
+            written = false;
             let _ = writeln!(err, "proofmark: could not write {}: {e}", path.display());
         }
     }
-    Ok(report.exit_code())
+    // A report that was asked for and not written makes the run fail: 2,
+    // unless the run already failed on its own.
+    let code = report.exit_code();
+    Ok(if written || code != 0 { code } else { 2 })
 }
 
 fn list(args: &mut Args, out: &mut dyn Write) -> Result<u8, Usage> {
@@ -565,5 +599,30 @@ fn serve_fake(args: &mut Args, out: &mut dyn Write, err: &mut dyn Write) -> Resu
     let _ = out.flush();
     loop {
         std::thread::park();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Broken;
+
+    impl Write for Broken {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("closed"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("closed"))
+        }
+    }
+
+    /// Output that could not be written means the command did not do what
+    /// it was asked, so it never exits 0.
+    #[test]
+    fn stdout_that_cannot_be_written_never_exits_0() {
+        let mut err = Vec::new();
+        let code = main(vec![OsString::from("list")], &mut Broken, &mut err);
+        assert_eq!(code, 2);
     }
 }

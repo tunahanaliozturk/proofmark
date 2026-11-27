@@ -253,6 +253,87 @@ fn exit_5_when_cleanup_leaves_something() {
     );
 }
 
+/// A value on a flag that takes none is refused, not ignored: before,
+/// `--use-existing-bucket=false` turned the mode on. A timeout too long
+/// to add to the clock is refused too, instead of panicking later.
+#[test]
+fn a_value_on_a_flag_and_an_endless_timeout_are_usage_errors() {
+    let (server, seen) = recording(FakeConfig::new());
+    foreign_put(&server.endpoint(), "data", None);
+    let sent_before = seen.lock().unwrap_or_else(PoisonError::into_inner).len();
+    let endpoint = server.endpoint().to_string();
+    let dir = temp_dir("flag-values");
+    for args in [
+        vec!["--bucket", "data", "--use-existing-bucket=false"],
+        vec!["--bucket", "data", "--use-existing-bucket="],
+        vec!["--verbose=false"],
+        vec!["--timeout", "18446744073709551615"],
+    ] {
+        let output = run(proofmark(&dir)
+            .args(["run", "--endpoint", &endpoint])
+            .args(&args));
+        assert_exit(&output, 2);
+    }
+    assert_eq!(
+        seen.lock().unwrap_or_else(PoisonError::into_inner).len(),
+        sent_before,
+        "a refused command line sent a request"
+    );
+}
+
+/// A report path that is the ledger, under any spelling, must not
+/// overwrite the ledger that cleanup still needs.
+#[test]
+fn a_report_is_never_written_over_the_ledger_cleanup_needs() {
+    let server = interfering(5, None);
+    let dir = temp_dir("report-over-ledger");
+    let endpoint = server.endpoint().to_string();
+    let output = run(proofmark(&dir).args([
+        "run",
+        "--endpoint",
+        &endpoint,
+        "--ledger",
+        "ledger.jsonl",
+        "--report",
+        "json=./ledger.jsonl",
+    ]));
+    assert_exit(&output, 5);
+    assert!(
+        text(&output.stderr).contains("ledger"),
+        "{}",
+        text(&output.stderr)
+    );
+    // Still a ledger: cleanup reads it, and the foreign object still holds
+    // the bucket.
+    let output = run(proofmark(&dir).args([
+        "cleanup",
+        "--endpoint",
+        &endpoint,
+        "--ledger",
+        "ledger.jsonl",
+    ]));
+    assert_exit(&output, 5);
+}
+
+/// A run whose report cannot be written did not give the user what they
+/// asked for, so it does not exit 0.
+#[test]
+fn a_report_that_cannot_be_written_never_exits_0() {
+    let server = FakeServer::start(FakeConfig::new()).expect("fake starts");
+    let dir = temp_dir("no-report");
+    let output = run(proofmark(&dir).args([
+        "run",
+        "--endpoint",
+        &server.endpoint().to_string(),
+        "--probe",
+        "basic.put-get",
+        "--report",
+        "json=no-such-directory/out.json",
+    ]));
+    assert_exit(&output, 2);
+    assert!(text(&output.stderr).contains("no-such-directory"));
+}
+
 // The safety rules.
 
 #[test]

@@ -348,9 +348,16 @@ pub fn execute(
             let (mut remote, ledger) = session.into_parts();
             drop(ledger);
             let cleanup = clean(&mut remote, &ledger_path, None);
-            // 409 is BucketAlreadyExists or BucketAlreadyOwnedByYou: the
-            // name is taken, which is a safety refusal.
-            let code = if matches!(made, Ok((409, _))) { 3 } else { 4 };
+            // Something left behind wins, as in a whole run. Otherwise 409
+            // is BucketAlreadyExists or BucketAlreadyOwnedByYou: the name is
+            // taken, which is a safety refusal.
+            let code = if !cleanup.complete() {
+                5
+            } else if matches!(made, Ok((409, _))) {
+                3
+            } else {
+                4
+            };
             let why = match made {
                 Ok((_, text)) => format!("CreateBucket answered {text}"),
                 Err(e) => e.to_string(),
