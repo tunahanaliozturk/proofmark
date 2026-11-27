@@ -211,6 +211,9 @@ pub enum ReadError {
         /// The line number, from 1.
         line: usize,
     },
+    /// The ledger reads, but names something proofmark would not have
+    /// written there, or was written for another endpoint.
+    Refused(String),
 }
 
 impl fmt::Display for ReadError {
@@ -220,6 +223,7 @@ impl fmt::Display for ReadError {
             Self::Malformed { line } => {
                 write!(f, "line {line} of the ledger is not a ledger entry")
             }
+            Self::Refused(why) => f.write_str(why),
         }
     }
 }
@@ -228,7 +232,7 @@ impl std::error::Error for ReadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(e) => Some(e),
-            Self::Malformed { .. } => None,
+            Self::Malformed { .. } | Self::Refused(_) => None,
         }
     }
 }

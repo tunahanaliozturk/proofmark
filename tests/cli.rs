@@ -358,6 +358,80 @@ fn cleanup_refuses_a_ledger_written_for_another_endpoint() {
     assert!(dir.join("ledger.jsonl").exists());
 }
 
+/// A ledger is trusted only where it names what proofmark itself writes:
+/// buckets `proofmark-<run id>-*`, and keys under `proofmark-<run id>/` in
+/// those or in the bucket given with `--bucket`. Anything else is refused
+/// before a single request is sent.
+#[test]
+fn cleanup_refuses_a_ledger_that_names_data_proofmark_does_not_write() {
+    let (server, seen) = recording(FakeConfig::new());
+    foreign_put(&server.endpoint(), "customer-data", None);
+    foreign_put(&server.endpoint(), "customer-data", Some("payroll.csv"));
+    foreign_put(&server.endpoint(), "proofmark-abcdef-main", None);
+    foreign_put(
+        &server.endpoint(),
+        "proofmark-abcdef-main",
+        Some("payroll.csv"),
+    );
+    let before = server.snapshot();
+    let sent_before = seen.lock().unwrap_or_else(PoisonError::into_inner).len();
+    let endpoint = server.endpoint().to_string();
+    let dir = temp_dir("foreign-ledger");
+    let header = format!(
+        "{{\"proofmark_ledger\":1,\"run_id\":\"abcdef\",\"endpoint\":\"{endpoint}\",\"region\":\"us-east-1\"}}\n"
+    );
+    for (entry, bucket) in [
+        (
+            r#"{"op":"put_object","bucket":"customer-data","key":"payroll.csv"}"#,
+            None,
+        ),
+        (
+            r#"{"op":"put_object","bucket":"customer-data","key":"payroll.csv"}"#,
+            Some("customer-data"),
+        ),
+        (
+            r#"{"op":"put_object","bucket":"customer-data","key":"proofmark-abcdef/x"}"#,
+            None,
+        ),
+        (
+            r#"{"op":"put_object","bucket":"proofmark-abcdef-main","key":"payroll.csv"}"#,
+            None,
+        ),
+        (r#"{"op":"create_bucket","bucket":"customer-data"}"#, None),
+        (
+            r#"{"op":"create_bucket","bucket":"customer-data"}"#,
+            Some("customer-data"),
+        ),
+    ] {
+        std::fs::write(dir.join("ledger.jsonl"), format!("{header}{entry}\n")).expect("ledger");
+        let mut command = proofmark(&dir);
+        command.args([
+            "cleanup",
+            "--endpoint",
+            &endpoint,
+            "--ledger",
+            "ledger.jsonl",
+        ]);
+        if let Some(bucket) = bucket {
+            command.args(["--bucket", bucket]);
+        }
+        let output = run(&mut command);
+        assert_exit(&output, 2);
+        assert!(
+            text(&output.stderr).contains("not proofmark's"),
+            "{entry}: {}",
+            text(&output.stderr)
+        );
+        assert!(dir.join("ledger.jsonl").exists());
+    }
+    assert_eq!(
+        seen.lock().unwrap_or_else(PoisonError::into_inner).len(),
+        sent_before,
+        "cleanup sent a request"
+    );
+    assert_eq!(server.snapshot(), before);
+}
+
 /// Kills the child process at the moment the fake has received request
 /// number `kill_at` (counted from the first request the run sends), before
 /// the fake answers it. The fake then carries the request out anyway, so

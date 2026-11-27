@@ -31,7 +31,9 @@ Usage:
   proofmark run      --endpoint URL [options]      run probes against an endpoint
   proofmark list     [--feature F]                 show the probes, no network
   proofmark explain  PROBE                         one probe in full
-  proofmark cleanup  --endpoint URL --ledger FILE  remove what an interrupted run left
+  proofmark cleanup  --endpoint URL --ledger FILE [--bucket NAME]
+                                                   remove what an interrupted run left;
+                                                   --bucket names the existing bucket it used
   proofmark fake     [--listen ADDR] [--fault F]   run the fake S3 server on loopback
 
 run options:
@@ -410,8 +412,8 @@ fn explain(args: &mut Args, out: &mut dyn Write) -> Result<u8, Usage> {
 }
 
 fn cleanup(args: &mut Args, out: &mut dyn Write, err: &mut dyn Write) -> Result<u8, Usage> {
-    let (mut endpoint, mut ledger, mut region, mut ca_file, mut timeout) =
-        (None, None, None, None, None);
+    let (mut endpoint, mut ledger, mut region, mut ca_file, mut timeout, mut bucket) =
+        (None, None, None, None, None, None);
     while let Some(arg) = args.next_arg() {
         let Arg::Option(name, inline) = arg else {
             return Err(usage("cleanup takes options only"));
@@ -422,6 +424,7 @@ fn cleanup(args: &mut Args, out: &mut dyn Write, err: &mut dyn Write) -> Result<
             "region" => region = Some(args.value(&name, inline)?),
             "ca-file" => ca_file = Some(args.value(&name, inline)?),
             "timeout" => timeout = Some(args.value(&name, inline)?),
+            "bucket" => bucket = Some(args.value(&name, inline)?),
             other => return Err(usage(format!("unknown option --{other} for cleanup"))),
         }
     }
@@ -433,6 +436,7 @@ fn cleanup(args: &mut Args, out: &mut dyn Write, err: &mut dyn Write) -> Result<
         region.as_deref(),
         &credentials()?,
         &ledger,
+        bucket.as_deref(),
         read_ca(ca_file)?.as_deref(),
         parse_timeout(timeout)?,
     );

@@ -22,7 +22,8 @@ const MAX_SKEW_SECONDS: i64 = 15 * 60;
 /// Where the probes work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BucketMode {
-    /// Create `proofmark-<run id>-main` and delete it afterwards.
+    /// Create `proofmark-<run id>-main`, work under `proofmark-<run id>/`
+    /// in it, and delete it afterwards.
     Own,
     /// Work under `proofmark-<run id>/` in this bucket, which must be empty.
     Existing(String),
@@ -235,8 +236,8 @@ fn run_probes(session: &mut Session, probes: &[&'static Probe]) -> Vec<ProbeResu
 
 /// Cleans up from the ledger file, turning a ledger that cannot be read
 /// into a leftover so the run reports it and exits 5.
-fn clean(remote: &mut Remote, path: &Path) -> Cleanup {
-    safety::cleanup(remote, path).unwrap_or_else(|e| Cleanup {
+fn clean(remote: &mut Remote, path: &Path, bucket: Option<&str>) -> Cleanup {
+    safety::cleanup(remote, path, bucket).unwrap_or_else(|e| Cleanup {
         left: vec![format!("{e}; nothing was deleted")],
         ..Cleanup::default()
     })
@@ -261,7 +262,7 @@ fn choose_bucket(
                     response.status()
                 )));
             }
-            (name, String::new(), true)
+            (name, safety::key_prefix(&config.run_id), true)
         }
         BucketMode::Existing(name) => {
             match safety::check_empty(remote, name)
@@ -274,7 +275,7 @@ fn choose_bucket(
                     )));
                 }
             }
-            (name.clone(), format!("proofmark-{}/", config.run_id), false)
+            (name.clone(), safety::key_prefix(&config.run_id), false)
         }
     })
 }
@@ -333,7 +334,7 @@ pub fn execute(config: &RunConfig, log: Option<Box<dyn Write + Send>>) -> Result
         if !matches!(made, Ok((200, _))) {
             let (mut remote, ledger) = session.into_parts();
             drop(ledger);
-            let cleanup = clean(&mut remote, &ledger_path);
+            let cleanup = clean(&mut remote, &ledger_path, None);
             // 409 is BucketAlreadyExists or BucketAlreadyOwnedByYou: the
             // name is taken, which is a safety refusal.
             let code = if matches!(made, Ok((409, _))) { 3 } else { 4 };
@@ -357,7 +358,11 @@ pub fn execute(config: &RunConfig, log: Option<Box<dyn Write + Send>>) -> Result
     let (mut remote, ledger) = session.into_parts();
     // Closed before cleanup, which may remove it.
     drop(ledger);
-    let cleanup = clean(&mut remote, &ledger_path);
+    let existing = match &config.bucket {
+        BucketMode::Own => None,
+        BucketMode::Existing(name) => Some(name.as_str()),
+    };
+    let cleanup = clean(&mut remote, &ledger_path, existing);
     Ok(Report {
         endpoint: config.endpoint.to_string(),
         region: config.region.clone(),
@@ -375,27 +380,26 @@ pub fn execute(config: &RunConfig, log: Option<Box<dyn Write + Send>>) -> Result
 }
 
 /// `proofmark cleanup`: deletes what the ledger at `path` records.
+/// `bucket` is the existing bucket the run worked in, if it did.
 ///
 /// # Errors
 ///
-/// [`Refusal`] with code 2 if the ledger cannot be read or names another
-/// endpoint, 4 if the endpoint could not be reached at all.
+/// [`Refusal`] with code 2 if the ledger cannot be read, names another
+/// endpoint, or names anything proofmark would not have written; 4 if the
+/// endpoint could not be reached at all.
 pub fn cleanup_command(
     endpoint: &Endpoint,
     region: Option<&str>,
     credentials: &Credentials,
     path: &Path,
+    bucket: Option<&str>,
     ca_pem: Option<&[u8]>,
     timeout: Duration,
 ) -> Result<Cleanup, Refusal> {
     let usage = |message: String| Refusal { code: 2, message };
-    let (header, entries) = ledger::read(path).map_err(|e| usage(e.to_string()))?;
-    let recorded = Endpoint::parse(&header.endpoint).map_err(|e| usage(e.to_string()))?;
-    if &recorded != endpoint {
-        return Err(usage(format!(
-            "the ledger was written for {recorded}, not {endpoint}; refusing to delete its keys elsewhere"
-        )));
-    }
+    // Read here only for the signing region; cleanup reads it again, and
+    // checks what it reads, before it deletes anything.
+    let (header, _) = ledger::read(path).map_err(|e| usage(e.to_string()))?;
     let client = client(endpoint, ca_pem, timeout)?;
     let mut remote = Remote::new(
         client,
@@ -403,10 +407,8 @@ pub fn cleanup_command(
         credentials.clone(),
         region.unwrap_or(&header.region),
     );
-    let plan = ledger::plan(&entries);
-    let planned = !plan.objects.is_empty() || !plan.buckets.is_empty();
-    let cleanup = safety::cleanup(&mut remote, path).map_err(|e| usage(e.to_string()))?;
-    if planned && cleanup.responses == 0 {
+    let cleanup = safety::cleanup(&mut remote, path, bucket).map_err(|e| usage(e.to_string()))?;
+    if !cleanup.complete() && cleanup.responses == 0 {
         return Err(Refusal::start(format!(
             "could not reach {endpoint}; nothing was deleted and the ledger is kept"
         )));

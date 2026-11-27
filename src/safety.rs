@@ -4,8 +4,8 @@
 
 use std::path::Path;
 
-use crate::http::HttpError;
-use crate::ledger::{self, ReadError};
+use crate::http::{Endpoint, HttpError};
+use crate::ledger::{self, Entry, Header, ReadError};
 use crate::rng::SplitMix64;
 use crate::s3;
 use crate::session::{Call, Remote};
@@ -18,6 +18,22 @@ pub fn run_id(rng: &mut SplitMix64) -> String {
     (0..6)
         .map(|_| char::from(ALPHABET[rng.below(ALPHABET.len())]))
         .collect()
+}
+
+/// Whether `id` is shaped like a run id from [`run_id`].
+#[must_use]
+pub fn is_run_id(id: &str) -> bool {
+    id.len() == 6
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+/// `proofmark-<run id>/`, the prefix of every key a run writes, in its own
+/// bucket or in an existing one.
+#[must_use]
+pub fn key_prefix(run_id: &str) -> String {
+    format!("proofmark-{run_id}/")
 }
 
 /// `proofmark-<run id>-<purpose>`, the name of a bucket this run creates.
@@ -153,16 +169,70 @@ impl Cleanup {
     }
 }
 
+/// Checks that a ledger names only what proofmark itself writes, for
+/// `endpoint`: buckets `proofmark-<run id>-*`, and keys under
+/// `proofmark-<run id>/` in those or in `bucket`, the existing bucket the
+/// user named. A ledger is a file anyone can edit, and cleanup deletes what
+/// it names, so nothing else in it is trusted.
+fn trust(
+    header: &Header,
+    entries: &[Entry],
+    endpoint: &Endpoint,
+    bucket: Option<&str>,
+) -> Result<(), String> {
+    let recorded = Endpoint::parse(&header.endpoint).map_err(|e| e.to_string())?;
+    if &recorded != endpoint {
+        return Err(format!(
+            "the ledger was written for {recorded}, not {endpoint}; refusing to delete its keys elsewhere"
+        ));
+    }
+    let id = &header.run_id;
+    if !is_run_id(id) {
+        return Err(format!(
+            "the ledger's run id {id:?} is not one proofmark makes; refusing to delete anything from it"
+        ));
+    }
+    let own =
+        |name: &str| name.starts_with(&format!("proofmark-{id}-")) && is_valid_bucket_name(name);
+    let prefix = key_prefix(id);
+    for (i, entry) in entries.iter().enumerate() {
+        let (ok, what) = match &entry.key {
+            None => (own(&entry.bucket), format!("bucket {}", entry.bucket)),
+            Some(key) => (
+                key.starts_with(&prefix)
+                    && (own(&entry.bucket) || bucket == Some(entry.bucket.as_str())),
+                format!("{}/{key}", entry.bucket),
+            ),
+        };
+        if !ok {
+            return Err(format!(
+                "line {} of the ledger names {what}, which is not proofmark's: run {id} only creates buckets proofmark-{id}-* and writes keys under {prefix}, in those or in the bucket given with --bucket; refusing to delete anything from this ledger",
+                i + 2
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Deletes exactly what the ledger at `path` records, one request per
 /// key, version and bucket: objects first, then buckets. It never lists
-/// and never deletes anything the ledger does not name. When nothing is
-/// left the ledger file is removed; otherwise it is kept for another try.
+/// and never deletes anything the ledger does not name. The ledger is read
+/// once, and refused unless it was written for this remote's endpoint and
+/// names only proofmark's own buckets and keys, `bucket` being the existing
+/// bucket a run worked in, if any. When nothing is left the ledger file is
+/// removed; otherwise it is kept for another try.
 ///
 /// # Errors
 ///
-/// [`ReadError`] if the ledger cannot be read. Nothing is deleted then.
-pub fn cleanup(remote: &mut Remote, path: &Path) -> Result<Cleanup, ReadError> {
-    let (_, entries) = ledger::read(path)?;
+/// [`ReadError`] if the ledger cannot be read or is refused. Nothing is
+/// deleted then.
+pub fn cleanup(
+    remote: &mut Remote,
+    path: &Path,
+    bucket: Option<&str>,
+) -> Result<Cleanup, ReadError> {
+    let (header, entries) = ledger::read(path)?;
+    trust(&header, &entries, remote.endpoint(), bucket).map_err(ReadError::Refused)?;
     let plan = ledger::plan(&entries);
     let mut done = Cleanup::default();
     for object in &plan.objects {
