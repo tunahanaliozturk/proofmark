@@ -6,6 +6,7 @@
 //! ledger before it is sent ([ADR 0004](../docs/adr/0004-only-touch-what-it-wrote.md)).
 //! A probe cannot write around it.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::io::{self, Write};
 
@@ -273,6 +274,9 @@ pub enum ProbeError {
     /// The ledger could not be written, so the write was not sent. The run
     /// stops here.
     Ledger(io::Error),
+    /// A `DELETE`, or a `PUT` over a key whose earlier write failed, aimed
+    /// at something this run has not created. It was not sent.
+    NotWritten(String),
 }
 
 impl fmt::Display for ProbeError {
@@ -280,6 +284,10 @@ impl fmt::Display for ProbeError {
         match self {
             Self::Http(e) => write!(f, "{e}"),
             Self::Ledger(e) => write!(f, "could not write the ledger: {e}"),
+            Self::NotWritten(what) => write!(
+                f,
+                "not sent: {what} was not created by this run, and proofmark only deletes or overwrites what it created"
+            ),
         }
     }
 }
@@ -289,6 +297,7 @@ impl std::error::Error for ProbeError {
         match self {
             Self::Http(e) => Some(e),
             Self::Ledger(e) => Some(e),
+            Self::NotWritten(_) => None,
         }
     }
 }
@@ -311,6 +320,9 @@ pub struct Session {
     rng: SplitMix64,
     probe: &'static str,
     exchanges: Vec<Exchange>,
+    /// Keys this run has sent a write to, and those a write created.
+    attempted: HashSet<(String, String)>,
+    created: HashSet<(String, String)>,
 }
 
 impl Session {
@@ -333,6 +345,8 @@ impl Session {
             rng: SplitMix64::new(seed),
             probe: "",
             exchanges: Vec::new(),
+            attempted: HashSet::new(),
+            created: HashSet::new(),
         }
     }
 
@@ -387,17 +401,41 @@ impl Session {
     /// Sends `call`, recording it under `label`. A write is announced in
     /// the ledger first and its outcome recorded after.
     ///
+    /// A `DELETE` is sent only for a key a write of this run created, and a
+    /// write only to a key that is new or that this run created: a key
+    /// whose earlier write failed may hold someone else's data.
+    ///
     /// # Errors
     ///
-    /// [`ProbeError::Ledger`] if the ledger cannot be written, in which
-    /// case nothing was sent; [`ProbeError::Http`] if there was no
+    /// [`ProbeError::NotWritten`] for a `DELETE` or write that breaks that
+    /// rule; [`ProbeError::Ledger`] if the ledger cannot be written; in
+    /// both cases nothing was sent. [`ProbeError::Http`] if there was no
     /// response.
     pub fn send(&mut self, label: &'static str, call: &Call) -> Result<&Response, ProbeError> {
+        let target = (call.bucket.clone(), call.key.clone().unwrap_or_default());
+        let allowed = match (call.method, &call.key) {
+            ("DELETE", None) => false,
+            ("DELETE", Some(_)) => self.created.contains(&target),
+            (_, Some(_)) if call.is_write() => {
+                !self.attempted.contains(&target) || self.created.contains(&target)
+            }
+            _ => true,
+        };
+        if !allowed {
+            return Err(ProbeError::NotWritten(format!(
+                "{} {}/{}",
+                call.method, target.0, target.1
+            )));
+        }
         let intent = call.is_write().then(|| call.ledger_entry());
         if let Some(intent) = &intent {
             self.ledger.record(intent).map_err(ProbeError::Ledger)?;
+            self.attempted.insert(target.clone());
         }
         let (request, response) = self.remote.send(call)?;
+        if intent.is_some() && (200..300).contains(&response.status()) {
+            self.created.insert(target);
+        }
         if let Some(intent) = &intent {
             let version = response
                 .header("x-amz-version-id")
@@ -436,6 +474,76 @@ mod tests {
         );
         assert!(!format!("{remote:?}").contains("s3cr3t"));
         assert!(!format!("{remote:?}").contains("tok-123"));
+    }
+
+    /// ADR 0004: a probe never deletes a key, or writes over one, unless
+    /// this run's own write created it.
+    #[test]
+    fn a_probe_cannot_delete_or_overwrite_a_key_it_did_not_create() {
+        let server =
+            crate::fake::FakeServer::start(crate::fake::FakeConfig::new()).expect("fake starts");
+        let remote = Remote::new(
+            Client::new(),
+            server.endpoint(),
+            crate::fake::credentials(),
+            crate::fake::DEFAULT_REGION,
+        );
+        let dir = std::env::temp_dir().join(format!("proofmark-session-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("guard.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let header = crate::ledger::Header {
+            run_id: "abc123".to_owned(),
+            endpoint: server.endpoint().to_string(),
+            region: crate::fake::DEFAULT_REGION.to_owned(),
+        };
+        let ledger = Ledger::create(&path, &header).expect("ledger");
+        let mut session = Session::new(remote, ledger, "abc123", "b", "proofmark-abc123/", 1);
+        session.begin("t");
+        let made = session.send("bucket", &Call::new("PUT", "b", None));
+        assert_eq!(made.expect("bucket").status(), 200);
+
+        let refused =
+            |r: Result<&Response, ProbeError>| matches!(r, Err(ProbeError::NotWritten(_)));
+        let never = Call::new("DELETE", "b", Some("proofmark-abc123/t/never"));
+        assert!(refused(session.send("delete", &never)));
+        assert!(refused(
+            session.send("bucket", &Call::new("DELETE", "b", None))
+        ));
+
+        // A write that was refused did not create the key: no second try.
+        let key = Some("proofmark-abc123/t/refused");
+        let bad = Call::new("PUT", "b", key).signed_with_wrong_secret();
+        assert_eq!(session.send("put", &bad).expect("put").status(), 403);
+        assert!(refused(session.send("put", &Call::new("PUT", "b", key))));
+        assert!(refused(
+            session.send("delete", &Call::new("DELETE", "b", key))
+        ));
+
+        let key = Some("proofmark-abc123/t/mine");
+        assert_eq!(
+            session
+                .send("put", &Call::new("PUT", "b", key))
+                .expect("put")
+                .status(),
+            200
+        );
+        assert_eq!(
+            session
+                .send("put", &Call::new("PUT", "b", key))
+                .expect("put")
+                .status(),
+            200
+        );
+        let delete = Call::new("DELETE", "b", key);
+        assert_eq!(
+            session.send("delete", &delete).expect("delete").status(),
+            204
+        );
+        assert_eq!(
+            session.send("delete", &delete).expect("delete").status(),
+            204
+        );
     }
 
     /// The scrub would hide a leak here too, so the name redaction of the

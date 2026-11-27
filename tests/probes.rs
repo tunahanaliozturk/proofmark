@@ -105,6 +105,53 @@ fn every_basic_probe_reports_each_of_its_faults() {
     assert_eq!(checked, 15, "one run per declared fault");
 }
 
+/// ADR 0004: a probe deletes only keys this run wrote. Every object `DELETE`
+/// the fake receives, from the probes or from cleanup, must follow a `PUT`
+/// of the same key.
+#[test]
+fn no_probe_deletes_a_key_the_run_has_not_written() {
+    use proofmark::http::Request;
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+    let for_hook = Arc::clone(&seen);
+    let server = FakeServer::start(FakeConfig::new().with_request_hook(Arc::new(
+        move |_, request: &Request| {
+            for_hook
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((request.method().to_owned(), request.path().to_owned()));
+        },
+    )))
+    .expect("fake starts");
+    let dir = temp_dir("deletes");
+    let report = run_against(
+        &server,
+        probe::all().iter().collect(),
+        dir.join("ledger.jsonl"),
+    );
+    assert!(report.cleanup.complete(), "{:?}", report.cleanup.left);
+    let mut written = std::collections::HashSet::new();
+    let mut deletes = 0;
+    for (method, path) in seen.lock().unwrap_or_else(PoisonError::into_inner).iter() {
+        let is_object = path.trim_start_matches('/').contains('/');
+        match method.as_str() {
+            "PUT" => {
+                written.insert(path.clone());
+            }
+            "DELETE" if is_object => {
+                deletes += 1;
+                assert!(
+                    written.contains(path),
+                    "{path} was deleted but never written"
+                );
+            }
+            _ => {}
+        }
+    }
+    assert!(deletes > 10, "only {deletes} object deletes");
+}
+
 #[test]
 fn a_taken_bucket_name_is_refused_before_anything_is_written() {
     use proofmark::http::{Client, Request};

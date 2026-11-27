@@ -57,15 +57,15 @@ fn md5_etag(data: &[u8]) -> String {
     format!("\"{}\"", hex(&md5(data)))
 }
 
+/// Writes `key`; `true` if the store answered 2xx.
 fn put(
     session: &mut Session,
     label: &'static str,
     key: &str,
     body: Vec<u8>,
-) -> Result<(), ProbeError> {
+) -> Result<bool, ProbeError> {
     let call = Call::new("PUT", session.bucket(), Some(key)).body(body);
-    session.send(label, &call)?;
-    Ok(())
+    Ok((200..300).contains(&session.send(label, &call)?.status()))
 }
 
 fn send(
@@ -251,7 +251,11 @@ fn run_overwrite(session: &mut Session) -> Result<(), ProbeError> {
     let key = session.key("object");
     let first = session.payload(300);
     let second = session.payload(200);
-    put(session, "first put", &key, first)?;
+    // A failed first write did not make the key this run's to overwrite;
+    // the judge reports the failure.
+    if !put(session, "first put", &key, first)? {
+        return Ok(());
+    }
     put(session, "second put", &key, second)?;
     send(session, "get", "GET", &key)
 }
@@ -300,13 +304,28 @@ fn judge_missing_bucket(ex: &[Exchange]) -> Judgement {
 
 // basic.delete-missing
 
+/// The key is written and deleted first, so the `DELETE` of a missing key
+/// goes to a key this run created (ADR 0004), not to one that someone else
+/// may have written since.
 fn run_delete_missing(session: &mut Session) -> Result<(), ProbeError> {
-    let key = session.key("never-written");
-    send(session, "delete", "DELETE", &key)
+    let key = session.key("object");
+    let data = session.payload(10);
+    if !put(session, "put", &key, data)? {
+        return Ok(());
+    }
+    let call = Call::new("DELETE", session.bucket(), Some(&key));
+    if !(200..300).contains(&session.send("delete", &call)?.status()) {
+        return Ok(());
+    }
+    send(session, "delete again", "DELETE", &key)
 }
 
 fn judge_delete_missing(ex: &[Exchange]) -> Judgement {
-    from_checks((|| status_is(exchange(ex, "delete")?, 204))())
+    from_checks((|| {
+        status_is(exchange(ex, "put")?, 200)?;
+        status_is(exchange(ex, "delete")?, 204)?;
+        status_is(exchange(ex, "delete again")?, 204)
+    })())
 }
 
 // basic.range
@@ -568,7 +587,7 @@ pub(super) static PROBES: &[Probe] = &[
         id: "basic.delete-missing",
         feature: "basic",
         expectation: Expectation {
-            statement: "DELETE of a key that does not exist answers 204. The DeleteObject reference does not say; DeleteObjects documents that a missing key is confirmed as deleted, and the single call is taken to behave the same, so the basis is observed",
+            statement: "DELETE of a key that no longer exists answers 204. The DeleteObject reference does not say; DeleteObjects documents that a missing key is confirmed as deleted, and the single call is taken to behave the same, so the basis is observed",
             basis: Basis::Observed,
             citation: Citation {
                 url: DELETE_OBJECTS,
@@ -576,7 +595,7 @@ pub(super) static PROBES: &[Probe] = &[
                 read: READ,
             },
         },
-        requests: "DELETE <key> that was never written",
+        requests: "PUT <key> with 10 random bytes, DELETE <key>, then DELETE <key> again",
         catches: &[loud(Fault::DeleteMissingIs404)],
         run: run_delete_missing,
         judge: judge_delete_missing,
