@@ -11,6 +11,7 @@ use proofmark::fake::{self, FakeConfig, FakeServer};
 use proofmark::probe::{self, Basis, Probe, Status};
 use proofmark::report::Report;
 use proofmark::run::{self, BucketMode, RunConfig};
+use proofmark::session::Secrets;
 
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("proofmark-probes-{}-{name}", std::process::id()));
@@ -34,7 +35,7 @@ fn run_against(server: &FakeServer, probes: Vec<&'static Probe>, ledger: PathBuf
         run_id: "mutest".to_owned(),
         fail_on: Status::ALL[1..].to_vec(),
     };
-    run::execute(&config, None).expect("the run starts")
+    run::execute(&config, None, &Secrets::default()).expect("the run starts")
 }
 
 #[test]
@@ -199,7 +200,7 @@ fn a_taken_bucket_name_is_refused_before_anything_is_written() {
         run_id: "mutest".to_owned(),
         fail_on: Status::ALL[1..].to_vec(),
     };
-    let refusal = run::execute(&config, None).expect_err("refused");
+    let refusal = run::execute(&config, None, &Secrets::default()).expect_err("refused");
     assert_eq!(refusal.code, 3, "{refusal}");
     let methods = methods
         .lock()

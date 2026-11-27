@@ -21,6 +21,7 @@ use crate::probe::{self, Probe, Status};
 use crate::rng::SplitMix64;
 use crate::run::{self, BucketMode, RunConfig};
 use crate::safety::{self, Cleanup};
+use crate::session::Secrets;
 use crate::sigv4::Credentials;
 
 const HELP: &str = "\
@@ -99,22 +100,65 @@ impl Args {
 
 /// Runs the command line `args` (without the program name), writing normal
 /// output to `out` and errors to `err`, and returns the exit code.
+///
+/// Output is held until the command ends and then scrubbed of every secret
+/// the command used, in each form a store could echo it in, as the last
+/// step before it is written. The credentials in the environment are known
+/// from the start, so even a usage error that repeats an argument is
+/// scrubbed. `fake` writes as it goes, because it serves until stopped; it
+/// prints only its own published key pair.
 pub fn main(args: Vec<OsString>, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
     let args: Result<Vec<String>, _> = args.into_iter().map(OsString::into_string).collect();
-    let result = match args {
-        Err(_) => Err(usage("arguments must be valid UTF-8")),
-        Ok(args) => dispatch(args, out, err),
-    };
-    match result {
-        Ok(code) => code,
-        Err(Usage(message)) => {
-            let _ = writeln!(err, "proofmark: {message}\nRun `proofmark help` for usage.");
-            2
+    let secrets = Secrets::default();
+    for name in [
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+    ] {
+        if let Ok(value) = std::env::var(name) {
+            secrets.add(&value);
         }
     }
+    let serving = matches!(&args, Ok(args) if args.first().is_some_and(|c| c == "fake"));
+    let (mut held_out, mut held_err) = (Vec::new(), Vec::new());
+    let code = {
+        let (out, err): (&mut dyn Write, &mut dyn Write) = if serving {
+            (&mut *out, &mut *err)
+        } else {
+            (&mut held_out, &mut held_err)
+        };
+        let result = match args {
+            Err(_) => Err(usage("arguments must be valid UTF-8")),
+            Ok(args) => dispatch(args, out, err, &secrets),
+        };
+        match result {
+            Ok(code) => code,
+            Err(Usage(message)) => {
+                let _ = writeln!(err, "proofmark: {message}\nRun `proofmark help` for usage.");
+                2
+            }
+        }
+    };
+    let _ = emit(out, &secrets, &held_out);
+    let _ = emit(err, &secrets, &held_err);
+    code
 }
 
-fn dispatch(args: Vec<String>, out: &mut dyn Write, err: &mut dyn Write) -> Result<u8, Usage> {
+/// Writes `held`, scrubbed of `secrets`, to `stream`.
+fn emit(stream: &mut dyn Write, secrets: &Secrets, held: &[u8]) -> io::Result<()> {
+    if held.is_empty() {
+        return Ok(());
+    }
+    stream.write_all(secrets.scrub(&String::from_utf8_lossy(held)).as_bytes())?;
+    stream.flush()
+}
+
+fn dispatch(
+    args: Vec<String>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    secrets: &Secrets,
+) -> Result<u8, Usage> {
     let mut args = args.into_iter();
     let command = args.next();
     let mut rest = Args { rest: args };
@@ -128,10 +172,10 @@ fn dispatch(args: Vec<String>, out: &mut dyn Write, err: &mut dyn Write) -> Resu
             let _ = writeln!(out, "proofmark {}", env!("CARGO_PKG_VERSION"));
             Ok(0)
         }
-        Some("run") => run_command(&mut rest, out, err),
+        Some("run") => run_command(&mut rest, out, err, secrets),
         Some("list") => list(&mut rest, out),
         Some("explain") => explain(&mut rest, out),
-        Some("cleanup") => cleanup(&mut rest, out, err),
+        Some("cleanup") => cleanup(&mut rest, out, err, secrets),
         Some("fake") => serve_fake(&mut rest, out, err),
         Some(other) => Err(usage(format!("unknown command {other:?}"))),
     }
@@ -312,7 +356,12 @@ fn parse_run(args: &mut Args) -> Result<Result<RunOptions, String>, Usage> {
     }))
 }
 
-fn run_command(args: &mut Args, out: &mut dyn Write, err: &mut dyn Write) -> Result<u8, Usage> {
+fn run_command(
+    args: &mut Args,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    secrets: &Secrets,
+) -> Result<u8, Usage> {
     let options = match parse_run(args)? {
         Ok(options) => options,
         Err(refusal) => {
@@ -323,7 +372,7 @@ fn run_command(args: &mut Args, out: &mut dyn Write, err: &mut dyn Write) -> Res
     let log: Option<Box<dyn Write + Send>> = options
         .verbose
         .then(|| Box::new(io::stderr()) as Box<dyn Write + Send>);
-    let report = match run::execute(&options.config, log) {
+    let report = match run::execute(&options.config, log, secrets) {
         Ok(report) => report,
         Err(refusal) => {
             let _ = writeln!(err, "proofmark: {refusal}");
@@ -337,7 +386,7 @@ fn run_command(args: &mut Args, out: &mut dyn Write, err: &mut dyn Write) -> Res
             Format::Junit => report.junit(),
             Format::Markdown => report.markdown(),
         };
-        if let Err(e) = std::fs::write(path, text) {
+        if let Err(e) = std::fs::write(path, secrets.scrub(&text)) {
             let _ = writeln!(err, "proofmark: could not write {}: {e}", path.display());
         }
     }
@@ -411,7 +460,12 @@ fn explain(args: &mut Args, out: &mut dyn Write) -> Result<u8, Usage> {
     Ok(0)
 }
 
-fn cleanup(args: &mut Args, out: &mut dyn Write, err: &mut dyn Write) -> Result<u8, Usage> {
+fn cleanup(
+    args: &mut Args,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    secrets: &Secrets,
+) -> Result<u8, Usage> {
     let (mut endpoint, mut ledger, mut region, mut ca_file, mut timeout, mut bucket) =
         (None, None, None, None, None, None);
     while let Some(arg) = args.next_arg() {
@@ -439,6 +493,7 @@ fn cleanup(args: &mut Args, out: &mut dyn Write, err: &mut dyn Write) -> Result<
         bucket.as_deref(),
         read_ca(ca_file)?.as_deref(),
         parse_timeout(timeout)?,
+        secrets,
     );
     let done: Cleanup = match result {
         Ok(done) => done,

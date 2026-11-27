@@ -12,7 +12,7 @@ use crate::probe::{self, Judgement, Probe, Status};
 use crate::report::{ExchangeSummary, ProbeResult, Report};
 use crate::s3;
 use crate::safety::{self, Cleanup, Emptiness};
-use crate::session::{Call, Exchange, ProbeError, Remote, Session};
+use crate::session::{Call, Exchange, ProbeError, Remote, Secrets, Session};
 use crate::sigv4::Credentials;
 use crate::time::UtcTime;
 
@@ -281,13 +281,18 @@ fn choose_bucket(
 }
 
 /// Runs `config` against the endpoint. `log`, if given, receives every
-/// exchange with secrets redacted.
+/// exchange with secrets redacted. Every secret the run uses, signatures
+/// included, is added to `secrets`, for scrubbing the output.
 ///
 /// # Errors
 ///
 /// [`Refusal`] when the run stops before any probe: exit code 3 when the
 /// safety rules refuse, 4 when it cannot start.
-pub fn execute(config: &RunConfig, log: Option<Box<dyn Write + Send>>) -> Result<Report, Refusal> {
+pub fn execute(
+    config: &RunConfig,
+    log: Option<Box<dyn Write + Send>>,
+    secrets: &Secrets,
+) -> Result<Report, Refusal> {
     let started = UtcTime::now();
     let client = client(&config.endpoint, config.ca_pem.as_deref(), config.timeout)?;
     let mut remote = Remote::new(
@@ -295,7 +300,8 @@ pub fn execute(config: &RunConfig, log: Option<Box<dyn Write + Send>>) -> Result
         config.endpoint.clone(),
         config.credentials.clone(),
         &config.region,
-    );
+    )
+    .with_secrets(secrets.clone());
     if let Some(log) = log {
         remote = remote.with_log(log);
     }
@@ -380,13 +386,18 @@ pub fn execute(config: &RunConfig, log: Option<Box<dyn Write + Send>>) -> Result
 }
 
 /// `proofmark cleanup`: deletes what the ledger at `path` records.
-/// `bucket` is the existing bucket the run worked in, if it did.
+/// `bucket` is the existing bucket the run worked in, if it did. Every
+/// secret it uses is added to `secrets`.
 ///
 /// # Errors
 ///
 /// [`Refusal`] with code 2 if the ledger cannot be read, names another
 /// endpoint, or names anything proofmark would not have written; 4 if the
 /// endpoint could not be reached at all.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one parameter per option of the cleanup command, plus the shared secrets"
+)]
 pub fn cleanup_command(
     endpoint: &Endpoint,
     region: Option<&str>,
@@ -395,6 +406,7 @@ pub fn cleanup_command(
     bucket: Option<&str>,
     ca_pem: Option<&[u8]>,
     timeout: Duration,
+    secrets: &Secrets,
 ) -> Result<Cleanup, Refusal> {
     let usage = |message: String| Refusal { code: 2, message };
     // Read here only for the signing region; cleanup reads it again, and
@@ -406,7 +418,8 @@ pub fn cleanup_command(
         endpoint.clone(),
         credentials.clone(),
         region.unwrap_or(&header.region),
-    );
+    )
+    .with_secrets(secrets.clone());
     let cleanup = safety::cleanup(&mut remote, path, bucket).map_err(|e| usage(e.to_string()))?;
     if !cleanup.complete() && cleanup.responses == 0 {
         return Err(Refusal::start(format!(

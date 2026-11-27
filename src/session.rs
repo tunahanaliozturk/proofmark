@@ -9,13 +9,14 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::io::{self, Write};
+use std::sync::{Arc, Mutex, PoisonError};
 
-use crate::checksum::sha256_hex;
+use crate::checksum::{base64, sha256_hex};
 use crate::http::{Client, Endpoint, HttpError, Request, Response};
 use crate::ledger::{Entry, Ledger};
 use crate::rng::SplitMix64;
 use crate::s3;
-use crate::sigv4::{Credentials, REDACTED, Signer, is_secret_name};
+use crate::sigv4::{Credentials, REDACTED, Signer, encode_component, is_secret_name};
 use crate::time::UtcTime;
 
 /// One S3 request before it is signed: method, bucket, key, query,
@@ -88,6 +89,84 @@ impl Call {
     }
 }
 
+/// Every secret a run has used, in each form a store could echo it in:
+/// as is, percent-encoded, and base64-encoded, alone or inside a longer
+/// base64 text. Clones share one list, so whoever writes output last can
+/// scrub it of every secret known by then, signatures included.
+#[derive(Clone, Default)]
+pub struct Secrets(Arc<Mutex<Vec<String>>>);
+
+impl fmt::Debug for Secrets {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Secrets { .. }")
+    }
+}
+
+/// Shorter encoded forms are not added: they would match ordinary text.
+const MIN_ENCODED: usize = 8;
+
+impl Secrets {
+    /// The access key id, the secret key and the session token.
+    #[must_use]
+    pub fn of(credentials: &Credentials) -> Self {
+        let secrets = Self::default();
+        secrets.add_credentials(credentials);
+        secrets
+    }
+
+    fn add_credentials(&self, credentials: &Credentials) {
+        self.add(credentials.access_key_id());
+        self.add(credentials.secret_access_key());
+        if let Some(token) = credentials.session_token() {
+            self.add(token);
+        }
+    }
+
+    /// Adds `secret` and its encoded forms. An empty one is ignored.
+    pub fn add(&self, secret: &str) {
+        if secret.is_empty() {
+            return;
+        }
+        let bytes = secret.as_bytes();
+        let mut forms = vec![secret.to_owned(), encode_component(bytes)];
+        // Inside a longer base64 text the secret starts at byte 0, 1 or 2
+        // of a 3-byte group. The characters before its first whole sextet
+        // and after its last one also carry bits of its neighbours; the
+        // ones between depend on the secret alone, whatever surrounds it.
+        for skip in 0..3 {
+            let mut shifted = vec![0_u8; skip];
+            shifted.extend_from_slice(bytes);
+            let encoded = base64(&shifted);
+            let (start, end) = ((skip * 4).div_ceil(3), shifted.len() * 4 / 3);
+            forms.extend(encoded.get(start..end).map(str::to_owned));
+        }
+        forms.push(base64(bytes));
+        let mut list = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        for form in forms {
+            let long_enough = form == secret || form.len() >= MIN_ENCODED;
+            if long_enough && !list.contains(&form) {
+                list.push(form);
+            }
+        }
+        // The longest first, so that a form is not cut up by a shorter one
+        // that occurs inside it.
+        list.sort_by_key(|form| std::cmp::Reverse(form.len()));
+    }
+
+    /// `text` with every form of every secret replaced.
+    #[must_use]
+    pub fn scrub(&self, text: &str) -> String {
+        let list = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut text = text.to_owned();
+        for form in list.iter() {
+            if text.contains(form.as_str()) {
+                text = text.replace(form.as_str(), REDACTED);
+            }
+        }
+        text
+    }
+}
+
 /// Signs and sends requests to one endpoint, and remembers every secret it
 /// used so that output can be scrubbed of them.
 pub struct Remote {
@@ -97,7 +176,7 @@ pub struct Remote {
     region: String,
     clock_offset: i64,
     log: Option<Box<dyn Write + Send>>,
-    secrets: Vec<String>,
+    secrets: Secrets,
 }
 
 impl fmt::Debug for Remote {
@@ -116,8 +195,7 @@ impl Remote {
     /// A remote for `endpoint`, signing with `credentials` in `region`.
     #[must_use]
     pub fn new(client: Client, endpoint: Endpoint, credentials: Credentials, region: &str) -> Self {
-        let mut secrets = vec![credentials.secret_access_key().to_owned()];
-        secrets.extend(credentials.session_token().map(str::to_owned));
+        let secrets = Secrets::of(&credentials);
         Self {
             client,
             endpoint,
@@ -127,6 +205,15 @@ impl Remote {
             log: None,
             secrets,
         }
+    }
+
+    /// The same remote, keeping its secrets in `secrets`, a list shared
+    /// with whoever writes the run's output.
+    #[must_use]
+    pub fn with_secrets(mut self, secrets: Secrets) -> Self {
+        secrets.add_credentials(&self.credentials);
+        self.secrets = secrets;
+        self
     }
 
     /// The same remote, writing every exchange to `log` with secrets
@@ -155,17 +242,12 @@ impl Remote {
         &self.region
     }
 
-    /// `text` with every secret this remote has used replaced: the secret
-    /// key, the session token, and every signature it has sent.
+    /// `text` with every secret this remote has used replaced, in each of
+    /// its forms: the access key id, the secret key, the session token, and
+    /// every signature it has sent.
     #[must_use]
     pub fn scrub(&self, text: &str) -> String {
-        let mut text = text.to_owned();
-        for secret in self.secrets.iter().filter(|s| !s.is_empty()) {
-            if text.contains(secret.as_str()) {
-                text = text.replace(secret.as_str(), REDACTED);
-            }
-        }
-        text
+        self.secrets.scrub(text)
     }
 
     /// Signs `call` and sends it.
@@ -199,7 +281,7 @@ impl Remote {
         };
         let signature = Signer::new(credentials, &self.region, "s3", time)
             .sign_request(&mut request, &sha256_hex(&call.body));
-        self.secrets.push(signature.signature().to_owned());
+        self.secrets.add(signature.signature());
         self.log_request(&request);
         let response = self.client.send(&self.endpoint, &request);
         match &response {
@@ -437,9 +519,9 @@ impl Session {
             self.created.insert(target);
         }
         if let Some(intent) = &intent {
-            let version = response
-                .header("x-amz-version-id")
-                .map(|v| self.remote.scrub(v));
+            // Kept exactly as sent: cleanup sends it back. The ledger is a
+            // record of what to delete, not output to scrub.
+            let version = response.header("x-amz-version-id").map(str::to_owned);
             self.ledger
                 .record(&intent.outcome(response.status(), version.as_deref()))
                 .map_err(ProbeError::Ledger)?;
@@ -479,10 +561,111 @@ mod tests {
             remote.scrub(
                 "<CanonicalRequest>x-amz-security-token:tok-123</CanonicalRequest> s3cr3t/key AKID"
             ),
-            "<CanonicalRequest>x-amz-security-token:<redacted></CanonicalRequest> <redacted> AKID"
+            "<CanonicalRequest>x-amz-security-token:<redacted></CanonicalRequest> <redacted> <redacted>"
         );
         assert!(!format!("{remote:?}").contains("s3cr3t"));
         assert!(!format!("{remote:?}").contains("tok-123"));
+    }
+
+    /// A store can echo a secret the way it received it or encoded: in a
+    /// query string, in a header, inside base64 such as a `Basic`
+    /// credential. Every one of those forms is scrubbed.
+    #[test]
+    fn scrub_covers_the_access_key_id_and_encoded_forms_of_each_secret() {
+        use crate::checksum::base64;
+        let (id, secret, token) = ("AKIDEXAMPLE7Q2", "s3cr3t/key+abc=", "tok/en+123456789");
+        let remote = Remote::new(
+            Client::new(),
+            Endpoint::parse("http://127.0.0.1:9").expect("endpoint"),
+            Credentials::new(id, secret).with_session_token(token),
+            "us-east-1",
+        );
+        for leak in [
+            id.to_owned(),
+            "s3cr3t%2Fkey%2Babc%3D".to_owned(),
+            "tok%2Fen%2B123456789".to_owned(),
+            base64(secret.as_bytes()),
+            base64(token.as_bytes()),
+            base64(id.as_bytes()),
+        ] {
+            let scrubbed = remote.scrub(&format!("echo: {leak}."));
+            assert!(!scrubbed.contains(&leak), "{leak} survived: {scrubbed}");
+        }
+        // Inside a longer base64 text the secret can sit at any offset.
+        for prefix in ["", "u:", "us:", "use:"] {
+            let leak = base64(format!("{prefix}{secret}").as_bytes());
+            let scrubbed = remote.scrub(&leak);
+            assert!(scrubbed.contains(REDACTED), "{prefix:?}: {leak} survived");
+        }
+        assert_eq!(remote.scrub("nothing secret here"), "nothing secret here");
+    }
+
+    /// A one-shot server on loopback that answers the first request with
+    /// `response`.
+    fn answer_once(response: String) -> Endpoint {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut seen = Vec::new();
+            let mut buf = [0_u8; 4096];
+            while let Ok(n @ 1..) = stream.read(&mut buf) {
+                seen.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&seen);
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let length = text[..end]
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    if seen.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let _ = stream.write_all(response.as_bytes());
+        });
+        Endpoint::parse(&format!("http://127.0.0.1:{port}")).expect("endpoint")
+    }
+
+    /// A version id is what cleanup sends back to delete that version, so
+    /// the ledger keeps it exactly, even when it happens to contain text
+    /// that equals a secret.
+    #[test]
+    fn the_ledger_keeps_a_version_id_exactly_as_the_store_sent_it() {
+        let endpoint = answer_once(
+            "HTTP/1.1 200 OK\r\nx-amz-version-id: abc\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                .to_owned(),
+        );
+        let remote = Remote::new(
+            Client::new(),
+            endpoint.clone(),
+            Credentials::new("AKID", "a"),
+            "us-east-1",
+        );
+        let dir = std::env::temp_dir().join(format!("proofmark-session-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("version.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let header = crate::ledger::Header {
+            run_id: "abc123".to_owned(),
+            endpoint: endpoint.to_string(),
+            region: "us-east-1".to_owned(),
+        };
+        let ledger = Ledger::create(&path, &header).expect("ledger");
+        let mut session = Session::new(remote, ledger, "abc123", "b", "proofmark-abc123/", 1);
+        session.begin("t");
+        let put = Call::new("PUT", "b", Some("proofmark-abc123/t/k"));
+        assert_eq!(session.send("put", &put).expect("put").status(), 200);
+        drop(session);
+        let (_, entries) = crate::ledger::read(&path).expect("read");
+        assert_eq!(entries[1].version_id.as_deref(), Some("abc"));
     }
 
     /// ADR 0004: a probe never deletes a key, or writes over one, unless
@@ -560,12 +743,12 @@ mod tests {
     #[test]
     fn the_log_redacts_secret_headers_by_name() {
         #[derive(Clone, Default)]
-        struct Shared(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        struct Shared(Arc<Mutex<Vec<u8>>>);
         impl Write for Shared {
             fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
                 self.0
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .unwrap_or_else(PoisonError::into_inner)
                     .extend_from_slice(buf);
                 Ok(buf.len())
             }

@@ -609,6 +609,80 @@ fn a_run_killed_after_any_number_of_requests_leaves_a_ledger_that_cleanup_finish
 
 // Secrets.
 
+/// A server on loopback that answers the first request with what
+/// `answer` makes of its head.
+fn answering(answer: impl Fn(&str) -> String + Send + 'static) -> String {
+    use std::io::{Read, Write};
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut seen = Vec::new();
+        let mut buf = [0_u8; 4096];
+        while let Ok(n @ 1..) = stream.read(&mut buf) {
+            seen.extend_from_slice(&buf[..n]);
+            if seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let _ = stream.write_all(answer(&String::from_utf8_lossy(&seen)).as_bytes());
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
+/// A store that echoes what it received into the one field proofmark
+/// prints from an error, the error code: the request's signature, or the
+/// access key id. Neither may reach any output.
+#[test]
+fn a_secret_the_store_echoes_into_an_error_code_appears_in_no_output() {
+    let echo_signature = |head: &str| {
+        head.split("Signature=")
+            .nth(1)
+            .and_then(|rest| rest.split(['\r', ',', ' ']).next())
+            .unwrap_or_default()
+            .to_owned()
+    };
+    for (what, echo) in [
+        (
+            "signature",
+            Box::new(echo_signature) as Box<dyn Fn(&str) -> String + Send>,
+        ),
+        (
+            "access key id",
+            Box::new(|_: &str| fake::ACCESS_KEY_ID.to_owned()),
+        ),
+    ] {
+        let echoed: Arc<Mutex<String>> = Arc::default();
+        let for_server = Arc::clone(&echoed);
+        let endpoint = answering(move |head| {
+            let value = echo(head);
+            *for_server.lock().unwrap_or_else(PoisonError::into_inner) = value.clone();
+            let body = format!("<Error><Code>{value}</Code></Error>");
+            format!(
+                "HTTP/1.1 403 Forbidden\r\nx-amz-request-id: {value}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        });
+        let dir = temp_dir("echo");
+        let output = run(proofmark(&dir).args(["run", "--endpoint", &endpoint, "--timeout", "5"]));
+        assert_exit(&output, 4);
+        let echoed = echoed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        assert!(echoed.len() > 10, "the server saw no {what}");
+        for (name, content) in [("stdout", &output.stdout), ("stderr", &output.stderr)] {
+            assert!(
+                !text(content).contains(&echoed),
+                "{name} contains the echoed {what}: {}",
+                text(content)
+            );
+        }
+    }
+}
+
 #[test]
 fn a_planted_secret_appears_in_no_output() {
     let signatures: Arc<Mutex<Vec<String>>> = Arc::default();
@@ -663,7 +737,11 @@ fn a_planted_secret_appears_in_no_output() {
         .unwrap_or_else(PoisonError::into_inner)
         .clone();
     assert!(signatures.len() > 40, "saw {} signatures", signatures.len());
-    let mut secrets = vec![token.to_owned(), fake::SECRET_ACCESS_KEY.to_owned()];
+    let mut secrets = vec![
+        token.to_owned(),
+        fake::SECRET_ACCESS_KEY.to_owned(),
+        fake::ACCESS_KEY_ID.to_owned(),
+    ];
     secrets.extend(signatures);
     for (name, content) in &outputs {
         for secret in &secrets {
